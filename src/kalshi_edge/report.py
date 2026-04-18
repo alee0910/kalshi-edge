@@ -52,12 +52,22 @@ class _Row:
     fc_methodology: dict[str, Any] = field(default_factory=dict)
     fc_data_sources: dict[str, Any] = field(default_factory=dict)
     fc_diagnostics: dict[str, Any] = field(default_factory=dict)
+    # Quantamental split, if present. ``fc_p_yes_quant_only`` is P(YES) before
+    # fundamental inputs were applied; ``fc_attribution`` unpacks per-input
+    # contribution entries (list) and ``fc_dropped`` the reasons we skipped
+    # any input. All None/empty for pure-quant forecasters.
+    fc_p_yes_quant_only: float | None = None
+    fc_attribution: list[dict[str, Any]] = field(default_factory=list)
+    fc_dropped: list[dict[str, Any]] = field(default_factory=list)
+    fc_mean_shift_underlying: float | None = None
+    fc_forecast_id: int | None = None
 
 
 _QUERY = """
 SELECT
     c.ticker, c.event_ticker, c.series_ticker, c.category, c.title, c.subtitle, c.close_time,
     s.yes_bid, s.yes_ask, s.volume_24h, s.liquidity, s.ts AS snapshot_ts,
+    f.id AS fc_id,
     f.p_yes AS fc_p_yes, f.p_yes_p05 AS fc_p05, f.p_yes_p95 AS fc_p95,
     f.model_confidence AS fc_model_confidence,
     f.null_reason AS fc_null_reason,
@@ -66,7 +76,11 @@ SELECT
     f.ts AS fc_ts,
     f.methodology AS fc_methodology,
     f.data_sources AS fc_data_sources,
-    f.diagnostics AS fc_diagnostics
+    f.diagnostics AS fc_diagnostics,
+    f.p_yes_quant_only AS fc_p_yes_quant_only,
+    a.attribution AS fc_attribution,
+    a.dropped AS fc_dropped,
+    a.mean_shift_underlying AS fc_mean_shift_underlying
 FROM contracts c
 LEFT JOIN (
     SELECT ticker, MAX(ts) AS max_ts FROM market_snapshots GROUP BY ticker
@@ -78,6 +92,8 @@ LEFT JOIN (
 ) fm ON fm.ticker = c.ticker
 LEFT JOIN forecasts f
     ON f.ticker = c.ticker AND f.ts = fm.max_ts
+LEFT JOIN forecast_attribution a
+    ON a.forecast_id = f.id
 ORDER BY c.category, s.volume_24h DESC NULLS LAST
 """
 
@@ -119,6 +135,11 @@ def _load_rows(db: Database) -> list[_Row]:
             fc_methodology=_parse_json(r["fc_methodology"]),
             fc_data_sources=_parse_json(r["fc_data_sources"]),
             fc_diagnostics=_parse_json(r["fc_diagnostics"]),
+            fc_p_yes_quant_only=r["fc_p_yes_quant_only"],
+            fc_attribution=_parse_json_list(r["fc_attribution"]),
+            fc_dropped=_parse_json_list(r["fc_dropped"]),
+            fc_mean_shift_underlying=r["fc_mean_shift_underlying"],
+            fc_forecast_id=r["fc_id"],
         ))
     return out
 
@@ -131,6 +152,19 @@ def _parse_json(s: str | None) -> dict[str, Any]:
         return obj if isinstance(obj, dict) else {}
     except (ValueError, TypeError):
         return {}
+
+
+def _parse_json_list(s: str | None) -> list[dict[str, Any]]:
+    """Parse a JSON array-of-dicts field; degrade to empty list."""
+    if not s:
+        return []
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, list):
+            return [x for x in obj if isinstance(x, dict)]
+        return []
+    except (ValueError, TypeError):
+        return []
 
 
 def _dte_days(close: datetime | None, now: datetime) -> float | None:
@@ -366,6 +400,13 @@ tr:nth-child(even) td { background: var(--row-alt); }
 footer { color: var(--muted); font-size: 12px; margin-top: 48px; border-top: 1px solid var(--border); padding-top: 16px; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
+table.fund-table { margin-top: 8px; font-size: 12px; }
+table.fund-table th, table.fund-table td { padding: 4px 8px; }
+table.fund-table code { color: var(--accent); }
+ul.fund-dropped { margin: 4px 0 0 0; padding-left: 20px; font-size: 12px; color: var(--muted); }
+ul.fund-dropped code { color: var(--fg); }
+.nav-sub { margin-bottom: 20px; font-size: 12px; color: var(--muted); }
+.nav-sub a { margin-right: 14px; }
 """
 
 
@@ -783,6 +824,7 @@ def _build_detail_html(r: _Row, mid: float | None) -> str:
         + "".join(pricing_lines)
         + "</div>"
         + narrative_block
+        + _fundamental_attribution_block(r)
         + "<div class=detail-section><div class=detail-h>How this edge was computed</div>"
         + _kv_block(r.fc_methodology)
         + "</div>"
@@ -794,6 +836,102 @@ def _build_detail_html(r: _Row, mid: float | None) -> str:
         + "</div>"
         + "</div>"
     )
+
+
+def _fundamental_attribution_block(r: _Row) -> str:
+    """Render the quant-only-vs-adjusted split and per-input attribution.
+
+    Only rendered for quantamental forecasts (``fc_p_yes_quant_only`` or
+    ``fc_attribution`` present). For pure-quant rows this returns ``""``.
+    """
+    if (
+        r.fc_p_yes_quant_only is None
+        and not r.fc_attribution
+        and not r.fc_dropped
+    ):
+        return ""
+
+    lines: list[str] = ["<div class=detail-section>"]
+    lines.append("<div class=detail-h>Fundamental attribution</div>")
+
+    # Split summary: quant-only vs adjusted P(YES).
+    if r.fc_p_yes_quant_only is not None and r.fc_p_yes is not None:
+        q_pts = r.fc_p_yes_quant_only * 100.0
+        adj_pts = r.fc_p_yes * 100.0
+        shift_pts = adj_pts - q_pts
+        lines.append(
+            f"<div class=kv><span class=k>quant-only P(YES)</span>"
+            f"<span class=v>{q_pts:.2f}¢</span></div>"
+            f"<div class=kv><span class=k>quant + fundamental</span>"
+            f"<span class=v>{adj_pts:.2f}¢ ({shift_pts:+.2f}¢ shift)</span></div>"
+        )
+    if r.fc_mean_shift_underlying is not None:
+        lines.append(
+            f"<div class=kv><span class=k>underlying mean shift</span>"
+            f"<span class=v>{r.fc_mean_shift_underlying:+.4f}</span></div>"
+        )
+
+    # Per-input table. Kept compact; full provenance lives in the brief.
+    if r.fc_attribution:
+        rows_html = [
+            "<table class='fund-table'>",
+            "<thead><tr>"
+            "<th>input</th>"
+            "<th class=num>anomaly</th>"
+            "<th class=num>β (shrunk)</th>"
+            "<th class=num>σ_β</th>"
+            "<th class=num>n_obs</th>"
+            "<th class=num>Δ underlying</th>"
+            "<th class=num>Δ P(YES)</th>"
+            "</tr></thead><tbody>",
+        ]
+        for a in r.fc_attribution:
+            ds_p = a.get("mean_shift_prob")
+            ds_p_s = "—" if ds_p is None else f"{ds_p * 100:+.2f}¢"
+            rows_html.append(
+                f"<tr>"
+                f"<td><code>{html.escape(str(a.get('name', '—')))}</code></td>"
+                f"<td class=num>{_fmt_float(a.get('anomaly'))}</td>"
+                f"<td class=num>{_fmt_float(a.get('beta_shrunk'))}</td>"
+                f"<td class=num>{_fmt_float(a.get('beta_std'))}</td>"
+                f"<td class=num>{_fmt_int(a.get('n_obs'))}</td>"
+                f"<td class=num>{_fmt_float(a.get('mean_shift_underlying'))}</td>"
+                f"<td class=num>{html.escape(ds_p_s)}</td>"
+                f"</tr>"
+            )
+        rows_html.append("</tbody></table>")
+        lines.extend(rows_html)
+    else:
+        lines.append(
+            "<div class=detail-empty>No active fundamental inputs drove this forecast "
+            "(all were missing, expired, or uncalibrated).</div>"
+        )
+
+    if r.fc_dropped:
+        dropped_items = [
+            f"<li><code>{html.escape(str(d.get('name', '?')))}</code> — "
+            f"{html.escape(str(d.get('reason', '?')))}</li>"
+            for d in r.fc_dropped
+        ]
+        lines.append(
+            "<div class=detail-h style='margin-top:10px'>Dropped inputs</div>"
+            f"<ul class='fund-dropped'>{''.join(dropped_items)}</ul>"
+        )
+
+    lines.append("</div>")
+    return "".join(lines)
+
+
+def _fmt_float(v: Any) -> str:
+    if v is None:
+        return "—"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return html.escape(str(v))
+    if abs(f) >= 1000 or (f != 0 and abs(f) < 1e-3):
+        return f"{f:+.4g}"
+    return f"{f:+.4f}"
 
 
 def build_report_html(db: Database, *, now: datetime | None = None) -> str:
@@ -827,6 +965,13 @@ def build_report_html(db: Database, *, now: datetime | None = None) -> str:
     parts.append(f"<style>{_CSS}</style></head><body><div class=wrap>")
 
     parts.append("<h1>kalshi-edge — live universe</h1>")
+    parts.append(
+        "<div class=nav-sub>"
+        "<a href='./index.html'>Universe</a>"
+        "<a href='./research_queue.html'>Research queue</a>"
+        "<a href='./calibration_split.html'>Calibration split</a>"
+        "</div>"
+    )
     parts.append("<div class=sub>")
     parts.append("Contracts currently tracked by the forecasting stack, sorted by edge. ")
     parts.append(f"Snapshot rendered {html.escape(now.strftime('%Y-%m-%d %H:%M UTC'))}. ")
@@ -1026,8 +1171,283 @@ def build_report_html(db: Database, *, now: datetime | None = None) -> str:
     return "".join(parts)
 
 
-def write_report(db: Database, out_path: Path, *, now: datetime | None = None) -> int:
-    """Render and write the report. Returns bytes written."""
-    html_out = build_report_html(db, now=now)
+def _page_shell(title: str, body: str, *, now: datetime) -> str:
+    """Wrap a body fragment in the same chrome as the main universe page."""
+    return (
+        "<!doctype html><html lang=en><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        f"<title>{html.escape(title)} — kalshi-edge</title>"
+        f"<style>{_CSS}</style></head><body><div class=wrap>"
+        f"<h1>{html.escape(title)}</h1>"
+        "<div class=nav-sub>"
+        "<a href='./index.html'>Universe</a>"
+        "<a href='./research_queue.html'>Research queue</a>"
+        "<a href='./calibration_split.html'>Calibration split</a>"
+        "</div>"
+        + body
+        + "<footer>"
+        + f"Rebuilt at {html.escape(now.strftime('%Y-%m-%d %H:%M UTC'))}."
+        + "</footer></div></body></html>"
+    )
+
+
+def build_research_queue_html(db: Database, *, now: datetime | None = None) -> str:
+    """Page listing contracts needing analyst attention.
+
+    A contract lands on the research queue if ANY of the following hold:
+
+        * The forecaster is quantamental (wraps fundamental inputs) and at
+          least one declared input for its category has no live entry. The
+          analyst can close the gap with a manual YAML.
+        * The forecaster is quantamental and at least one live input was
+          dropped at integration time (e.g. ``input_expired``,
+          ``uncalibrated_loading``).
+        * The model shows a large, liquid-market disagreement (|edge| ≥
+          15¢ AND |edge| ≥ ``_BET_MIN_EDGE_PTS``) — these deserve a human
+          eyeball before the ranker acts.
+
+    Rows are sorted so the gappiest/most-divergent sit at the top. The
+    page is self-contained and uses the same CSS as the main report.
+    """
+    now = now or datetime.now(timezone.utc)
+    rows = _load_rows(db)
+
+    # Per-category expected input sets. Kept local so report.py doesn't force
+    # a hard import dependency on the fundamental package if it isn't loaded.
+    expected_by_cat = _expected_inputs_by_category()
+
+    # Per-category sets of observed input names (from the latest attribution
+    # of each forecast in that category). Cheap to compute from the already-
+    # loaded rows.
+    observed_by_cat: dict[str, set[str]] = {}
+    for r in rows:
+        names = {a.get("name") for a in r.fc_attribution if a.get("name")}
+        if names:
+            observed_by_cat.setdefault(r.category, set()).update(
+                x for x in names if isinstance(x, str)
+            )
+
+    @dataclass(frozen=True, slots=True)
+    class _QueueItem:
+        row: _Row
+        missing_inputs: tuple[str, ...]
+        dropped_inputs: tuple[str, ...]
+        divergence_pts: float | None
+        sort_key: float
+
+    queue: list[_QueueItem] = []
+    for r in rows:
+        expected = expected_by_cat.get(r.category, set())
+        observed_names = {a.get("name") for a in r.fc_attribution if a.get("name")}
+        missing = tuple(sorted(expected - observed_names)) if expected else ()
+        dropped = tuple(sorted(str(d.get("name", "?")) for d in r.fc_dropped))
+        mid = _mid_cents(r)
+        edge = _edge_points(r)
+        divergence = None
+        # Only flag divergence for forecasted rows with a liquid market.
+        if (
+            r.fc_p_yes is not None and mid is not None and edge is not None
+            and _is_liquid(r) and abs(edge) >= max(_BET_MIN_EDGE_PTS, 15.0)
+        ):
+            divergence = edge
+
+        if not missing and not dropped and divergence is None:
+            continue
+
+        # Bigger problems sort higher. Scale: missing-count * 10 + dropped * 5
+        # + |divergence|. Negative to sort DESC.
+        score = -(
+            len(missing) * 10.0
+            + len(dropped) * 5.0
+            + (abs(divergence) if divergence is not None else 0.0)
+        )
+        queue.append(_QueueItem(
+            row=r,
+            missing_inputs=missing,
+            dropped_inputs=dropped,
+            divergence_pts=divergence,
+            sort_key=score,
+        ))
+
+    queue.sort(key=lambda q: (q.sort_key, q.row.ticker))
+
+    body: list[str] = []
+    body.append(
+        "<div class=sub>"
+        "Contracts where the system wants the analyst to look. Items fall "
+        "into three buckets: missing fundamental inputs (analyst can fill), "
+        "dropped inputs (expired or uncalibrated), and large model-vs-market "
+        "disagreements on liquid markets."
+        "</div>"
+    )
+
+    if not queue:
+        body.append(
+            "<div class=notice>No items on the research queue. Either every "
+            "expected input is live and calibrated, or no forecaster has run "
+            "yet.</div>"
+        )
+        return _page_shell("Research queue", "".join(body), now=now)
+
+    body.append(
+        "<table><thead><tr>"
+        "<th>ticker</th><th>title</th>"
+        "<th class=num>edge</th>"
+        "<th>missing</th><th>dropped</th>"
+        "<th>reason</th>"
+        "</tr></thead><tbody>"
+    )
+    for q in queue:
+        r = q.row
+        mid = _mid_cents(r)
+        edge_txt, edge_cls = _fmt_edge_points(r.fc_p_yes, mid)
+        reasons: list[str] = []
+        if q.missing_inputs:
+            reasons.append(f"{len(q.missing_inputs)} missing input(s)")
+        if q.dropped_inputs:
+            reasons.append(f"{len(q.dropped_inputs)} dropped input(s)")
+        if q.divergence_pts is not None:
+            reasons.append(f"liquid divergence {q.divergence_pts:+.1f}¢")
+        body.append(
+            f"<tr>"
+            f"<td class=ticker>"
+            f"<a href='{html.escape(_kalshi_url(r))}' target=_blank rel=noopener>"
+            f"{html.escape(r.ticker)}</a></td>"
+            f"<td class=title title='{html.escape(r.title)}'>{html.escape(r.title)}</td>"
+            f"<td class='num edge {edge_cls}'>{edge_txt}</td>"
+            f"<td>{_fmt_name_list(q.missing_inputs)}</td>"
+            f"<td>{_fmt_name_list(q.dropped_inputs)}</td>"
+            f"<td>{html.escape('; '.join(reasons))}</td>"
+            f"</tr>"
+        )
+    body.append("</tbody></table>")
+    return _page_shell("Research queue", "".join(body), now=now)
+
+
+def _fmt_name_list(names: tuple[str, ...]) -> str:
+    if not names:
+        return "—"
+    inner = ", ".join(f"<code>{html.escape(n)}</code>" for n in names)
+    return f"<span class=yes-side>{inner}</span>"
+
+
+def _expected_inputs_by_category() -> dict[str, set[str]]:
+    """Return {category: {input_name, ...}} from declared InputSpecs.
+
+    Imports live inside the function so that the top of report.py doesn't
+    force loading the fundamental package (keeps the dashboard usable even
+    if fundamentals haven't been initialized yet).
+    """
+    try:
+        from kalshi_edge.fundamental.schemas.cpi import cpi_input_specs
+    except ImportError:
+        return {}
+    out: dict[str, set[str]] = {}
+    for spec in cpi_input_specs():
+        out.setdefault(spec.category, set()).add(spec.name)
+    return out
+
+
+def build_calibration_split_html(db: Database, *, now: datetime | None = None) -> str:
+    """Page showing quant-only vs quant+fundamental Brier / log-loss split.
+
+    Only meaningful once resolved forecasts start accumulating in
+    ``calibration_records``. For quantamental forecasters, each row records
+    both the quant-only and quant+fundamental Brier; this page aggregates
+    them per forecaster and displays the delta. A negative delta (funda-
+    mental is better) is the evidence we need that the fundamental layer
+    earns its complexity.
+    """
+    now = now or datetime.now(timezone.utc)
+    cur = db.execute(
+        """
+        SELECT forecaster, category,
+               COUNT(*) AS n,
+               AVG(brier) AS brier,
+               AVG(log_score) AS log_score,
+               AVG(brier_quant_only) AS brier_qonly,
+               AVG(log_score_quant_only) AS log_qonly,
+               SUM(CASE WHEN p_yes_quant_only IS NOT NULL THEN 1 ELSE 0 END) AS n_qonly
+        FROM calibration_records
+        GROUP BY forecaster, category
+        ORDER BY forecaster, category
+        """
+    )
+    rows = list(cur.fetchall())
+
+    body: list[str] = []
+    body.append(
+        "<div class=sub>"
+        "Per-forecaster Brier / log-loss split. For quantamental forecasters "
+        "the <b>Δ Brier</b> column (quant+fundamental minus quant-only) says "
+        "whether fundamentals are adding alpha: negative means the full model "
+        "is scoring better than the quant-only pass."
+        "</div>"
+    )
+    if not rows:
+        body.append(
+            "<div class=notice>No calibration records yet. This page fills "
+            "in once forecasts start resolving.</div>"
+        )
+        return _page_shell("Calibration split", "".join(body), now=now)
+
+    body.append(
+        "<table><thead><tr>"
+        "<th>forecaster</th><th>category</th>"
+        "<th class=num>n</th><th class=num>n (QF)</th>"
+        "<th class=num>Brier</th><th class=num>Brier (quant-only)</th>"
+        "<th class=num>Δ Brier</th>"
+        "<th class=num>log-loss</th><th class=num>log-loss (quant-only)</th>"
+        "</tr></thead><tbody>"
+    )
+    for r in rows:
+        brier = r["brier"]
+        brier_q = r["brier_qonly"]
+        d_brier = (brier - brier_q) if (brier is not None and brier_q is not None) else None
+        d_cls = ""
+        if d_brier is not None:
+            d_cls = "pos" if d_brier < 0 else ("neg" if d_brier > 0 else "neu")
+        d_brier_s = _fmt_float(d_brier) if d_brier is not None else "—"
+        body.append(
+            f"<tr>"
+            f"<td><code>{html.escape(r['forecaster'] or '—')}</code></td>"
+            f"<td>{html.escape(r['category'] or '—')}</td>"
+            f"<td class=num>{r['n']}</td>"
+            f"<td class=num>{r['n_qonly'] or 0}</td>"
+            f"<td class=num>{_fmt_float(brier)}</td>"
+            f"<td class=num>{_fmt_float(brier_q)}</td>"
+            f"<td class='num edge {d_cls}'>{d_brier_s}</td>"
+            f"<td class=num>{_fmt_float(r['log_score'])}</td>"
+            f"<td class=num>{_fmt_float(r['log_qonly'])}</td>"
+            f"</tr>"
+        )
+    body.append("</tbody></table>")
+    return _page_shell("Calibration split", "".join(body), now=now)
+
+
+def write_report(
+    db: Database,
+    out_path: Path,
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Render the universe page AND its companion subpages.
+
+    ``out_path`` is the main universe HTML. ``research_queue.html`` and
+    ``calibration_split.html`` are written next to it so the in-page nav
+    links work on a GitHub Pages / local file drop. Returns the main page's
+    byte count so callers have a simple success signal.
+    """
+    now = now or datetime.now(timezone.utc)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    return out_path.write_text(html_out, encoding="utf-8")
+
+    main_html = build_report_html(db, now=now)
+    n = out_path.write_text(main_html, encoding="utf-8")
+
+    rq_path = out_path.parent / "research_queue.html"
+    rq_path.write_text(build_research_queue_html(db, now=now), encoding="utf-8")
+
+    cs_path = out_path.parent / "calibration_split.html"
+    cs_path.write_text(build_calibration_split_html(db, now=now), encoding="utf-8")
+
+    return n

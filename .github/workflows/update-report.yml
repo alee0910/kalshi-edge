@@ -53,16 +53,43 @@ jobs:
           uv run kalshi-edge pull-universe \
             --series "KXHIGHNY,KXHIGHLAX,KXHIGHCHI,KXHIGHMIA,KXHIGHAUS,KXHIGHDEN,KXHIGHPHIL,KXHIGHPHX,KXCPIYOY,KXCPI,KXFED,KXFEDDECISION,KXNBAGAME,KXNHL,KXATPMATCH,KXMLBGAME,KXPRES,KXSEN,KXHOUSE,KXGOV,KXELECT,KXPRIMARY"
 
+      - name: Pull fundamental inputs (automated + analyst YAML)
+        # Automated FRED pulls feed the CPI quantamental forecaster's
+        # prior-shift integration. The manual loader walks analyst_inputs/
+        # and rejects any malformed YAML (strict mode is the default). If
+        # FRED_API_KEY is not set as a secret, the automated half is a
+        # no-op and only the analyst YAML lands in the DB.
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: uv run kalshi-edge pull-fundamental
+
+      - name: Calibrate fundamental loadings
+        # Refits β for every CPI input from FRED history and writes to
+        # fundamental_loadings. Skipped automatically (soft fail) if FRED
+        # is down or no key is configured; the QF forecaster then falls
+        # back to the quant-only posterior and records "uncalibrated_loading"
+        # in its attribution log for each input.
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: uv run kalshi-edge calibrate-loadings || echo "calibration skipped (likely no FRED_API_KEY)"
+
       - name: Run forecasters
-        # Weather → Open-Meteo (public). Economics → FRED. Sports → the-odds-api
-        # (bookmaker ensemble). Rates → Polymarket FOMC cross-market prior.
-        # Politics → Polymarket cross-market prior. Each forecaster abstains
-        # with an explicit reason when its data source or a match is missing,
-        # per the project "no fake precision" rule.
+        # Weather → Open-Meteo (public). Economics → FRED (quantamental when
+        # fundamental inputs + loadings are present). Sports → the-odds-api.
+        # Rates → Polymarket FOMC cross-market prior. Politics → Polymarket
+        # cross-market prior. Each forecaster abstains with an explicit
+        # reason when its data source or a match is missing, per the
+        # project "no fake precision" rule.
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
           THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
         run: uv run kalshi-edge forecast
+
+      - name: Build research briefs
+        # Writes one Markdown brief per contract under site/briefs/ so the
+        # dashboard can link to them and GH Pages serves them as part of
+        # the deployed artifact.
+        run: uv run kalshi-edge build-briefs --out site/briefs
 
       - name: Build HTML report
         run: uv run kalshi-edge build-report --out site/index.html

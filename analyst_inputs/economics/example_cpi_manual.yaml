@@ -1,0 +1,37 @@
+# Example manual CPI fundamental-input file.
+#
+# This file is loaded by ``kalshi_edge.fundamental.manual.loader`` and every
+# entry is validated against ``cpi_input_specs()``. See
+# ``analyst_inputs/README.md`` for the full contract.
+#
+# Delete or rename this file when you add a real input for a live cycle;
+# it is kept in the repo as a living example, not as a live signal.
+
+category: economics
+analyst: example_analyst
+
+inputs:
+  # Analyst-entered gasoline-change signal. In the normal path the automated
+  # FRED pull fills this in — use a manual entry only when you have a better
+  # estimate (e.g. cross-checked vs EIA's Weekly Retail report).
+  - name: gasoline_weekly_delta
+    value: 0.021                      # 2.1% 4-week log-change
+    uncertainty: 0.004                # 1σ, same units (log-return)
+    mechanism: prior_shift             # must match the spec's declared mechanism
+    observation_at: 2026-04-15T00:00:00Z
+    expires_in_days: 21
+    scope:
+      transform: mom                  # this input shifts the MoM forecaster only
+    notes: "Cross-checked vs EIA Weekly Retail Gasoline report released 2026-04-15."
+
+  # Supply-chain z-score, analyst-estimated from sector reads because the
+  # GSCPI series has a 3-4 week publishing lag and a cycle may close first.
+  - name: supply_chain_pressure
+    value: 0.30
+    uncertainty: 0.15
+    mechanism: prior_shift
+    observation_at: 2026-04-12T00:00:00Z
+    expires_in_days: 30
+    scope:
+      transform: mom
+    notes: "Own estimate: freight rates up moderately, port congestion steady."

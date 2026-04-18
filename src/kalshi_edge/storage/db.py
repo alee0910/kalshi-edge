@@ -128,10 +128,35 @@ class Database:
         sql = _SCHEMA_PATH.read_text()
         c = self._conn()
         c.executescript(sql)
+        # Defensive migration for databases created before the quantamental
+        # columns were added. SQLite < 3.35 doesn't support "ADD COLUMN IF
+        # NOT EXISTS", so we inspect PRAGMA table_info and add any missing
+        # columns one at a time. This is idempotent.
+        self._migrate_add_columns(c, "forecasts", [
+            ("p_yes_quant_only", "REAL"),
+            ("p_yes_std_quant_only", "REAL"),
+            ("binary_posterior_quant_only", "BLOB"),
+            ("binary_posterior_quant_only_kind", "TEXT"),
+            ("binary_posterior_quant_only_params", "TEXT"),
+        ])
+        self._migrate_add_columns(c, "calibration_records", [
+            ("p_yes_quant_only", "REAL"),
+            ("brier_quant_only", "REAL"),
+            ("log_score_quant_only", "REAL"),
+        ])
         c.execute(
             "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
             (_SCHEMA_VERSION,),
         )
+
+    @staticmethod
+    def _migrate_add_columns(
+        conn: sqlite3.Connection, table: str, cols: list[tuple[str, str]]
+    ) -> None:
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, ddl in cols:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     # ------- contracts ---------------------------------------------------
     def upsert_contract(self, contract: Contract) -> None:
@@ -226,6 +251,12 @@ class Database:
         q05 = float(result.binary_posterior.quantile(0.05)) if not result.is_null() else None
         q95 = float(result.binary_posterior.quantile(0.95)) if not result.is_null() else None
 
+        # Quantamental split. For pure-quant forecasters these are None.
+        qo = getattr(result, "quant_only_binary_posterior", None)
+        qo_blob, qo_kind, qo_params = _dist_to_storage(qo)
+        qo_p_yes = float(qo.mean()) if qo is not None else None
+        qo_p_yes_std = float(qo.std()) if qo is not None else None
+
         cur = self._conn().execute(
             """
             INSERT OR REPLACE INTO forecasts (
@@ -234,8 +265,11 @@ class Database:
                 binary_posterior, binary_posterior_kind, binary_posterior_params,
                 underlying_posterior, underlying_posterior_kind, underlying_posterior_params,
                 uncertainty, model_confidence, methodology, data_sources, diagnostics,
-                null_reason
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                null_reason,
+                p_yes_quant_only, p_yes_std_quant_only,
+                binary_posterior_quant_only, binary_posterior_quant_only_kind,
+                binary_posterior_quant_only_params
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 result.ticker, _iso(result.ts), result.forecaster, result.version,
@@ -250,6 +284,8 @@ class Database:
                 json.dumps({k: _iso(v) for k, v in result.data_sources.items()}),
                 json.dumps(result.diagnostics, default=str),
                 result.null_reason,
+                qo_p_yes, qo_p_yes_std,
+                qo_blob, qo_kind, qo_params,
             ),
         )
         return int(cur.lastrowid or 0)
@@ -309,6 +345,191 @@ class Database:
              _iso(resolved_at), brier, log_score),
         )
 
+    # ------- fundamental inputs -----------------------------------------
+    def insert_fundamental_input(
+        self,
+        *,
+        name: str,
+        category: str,
+        value: float,
+        uncertainty: float | None,
+        mechanism: str,
+        source: str,
+        source_kind: str,
+        fetched_at: datetime,
+        observation_at: datetime,
+        expires_at: datetime,
+        scope: dict[str, Any] | None = None,
+        notes: str | None = None,
+    ) -> int:
+        cur = self._conn().execute(
+            """
+            INSERT OR IGNORE INTO fundamental_inputs (
+                name, category, value, uncertainty, mechanism,
+                source, source_kind, fetched_at, observation_at, expires_at,
+                scope, notes
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                name, category, float(value),
+                None if uncertainty is None else float(uncertainty),
+                mechanism, source, source_kind,
+                _iso(fetched_at), _iso(observation_at), _iso(expires_at),
+                json.dumps(scope or {}), notes,
+            ),
+        )
+        return int(cur.lastrowid or 0)
+
+    def latest_fundamental_inputs(
+        self, *, category: str | None = None, as_of: datetime | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return the most recent non-expired input per name.
+
+        "Most recent" is by ``fetched_at`` DESC. If ``as_of`` is provided,
+        only inputs fetched at or before that time are considered — useful
+        for rerunning historical forecasts without leaking future data.
+        """
+        args: list[Any] = []
+        q = """
+            SELECT name, category, value, uncertainty, mechanism, source,
+                   source_kind, fetched_at, observation_at, expires_at, scope, notes
+            FROM fundamental_inputs
+            WHERE 1=1
+        """
+        if category is not None:
+            q += " AND category = ?"
+            args.append(category)
+        if as_of is not None:
+            q += " AND fetched_at <= ?"
+            args.append(_iso(as_of))
+        q += " ORDER BY name, fetched_at DESC"
+
+        out: dict[str, dict[str, Any]] = {}
+        for r in self._conn().execute(q, tuple(args)):
+            if r["name"] in out:
+                continue  # take first (most recent) per name
+            expires = _parse_iso(r["expires_at"])
+            now = as_of or datetime.now(timezone.utc)
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=timezone.utc)
+            if expires and expires <= now:
+                continue  # expired; skip (the integration engine would drop it anyway)
+            out[r["name"]] = {
+                "name": r["name"],
+                "category": r["category"],
+                "value": r["value"],
+                "uncertainty": r["uncertainty"],
+                "mechanism": r["mechanism"],
+                "source": r["source"],
+                "source_kind": r["source_kind"],
+                "fetched_at": _parse_iso(r["fetched_at"]),
+                "observation_at": _parse_iso(r["observation_at"]),
+                "expires_at": expires,
+                "scope": json.loads(r["scope"]) if r["scope"] else {},
+                "notes": r["notes"],
+            }
+        return out
+
+    # ------- fundamental loadings ---------------------------------------
+    def insert_fundamental_loading(
+        self,
+        *,
+        name: str,
+        mechanism: str,
+        beta: float,
+        beta_std: float,
+        baseline: float,
+        n_obs: int,
+        fit_method: str,
+        fit_at: datetime,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> int:
+        cur = self._conn().execute(
+            """
+            INSERT OR REPLACE INTO fundamental_loadings (
+                name, mechanism, beta, beta_std, baseline, n_obs,
+                fit_method, fit_at, diagnostics
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                name, mechanism, float(beta), float(beta_std), float(baseline),
+                int(n_obs), fit_method, _iso(fit_at),
+                json.dumps(diagnostics or {}, default=str),
+            ),
+        )
+        return int(cur.lastrowid or 0)
+
+    def latest_loadings(self) -> dict[str, dict[str, Any]]:
+        """Return the latest loading per input name."""
+        out: dict[str, dict[str, Any]] = {}
+        for r in self._conn().execute(
+            """
+            SELECT name, mechanism, beta, beta_std, baseline, n_obs,
+                   fit_method, fit_at, diagnostics
+            FROM fundamental_loadings ORDER BY name, fit_at DESC
+            """
+        ):
+            if r["name"] in out:
+                continue
+            out[r["name"]] = {
+                "name": r["name"],
+                "mechanism": r["mechanism"],
+                "beta": r["beta"],
+                "beta_std": r["beta_std"],
+                "baseline": r["baseline"],
+                "n_obs": r["n_obs"],
+                "fit_method": r["fit_method"],
+                "fit_at": _parse_iso(r["fit_at"]),
+                "diagnostics": json.loads(r["diagnostics"]) if r["diagnostics"] else {},
+            }
+        return out
+
+    # ------- forecast attribution ---------------------------------------
+    def insert_forecast_attribution(
+        self,
+        *,
+        forecast_id: int,
+        ticker: str,
+        forecaster: str,
+        quant_p_yes: float | None,
+        adjusted_p_yes: float | None,
+        mean_shift_underlying: float | None,
+        attribution: list[dict[str, Any]],
+        dropped: list[dict[str, Any]],
+    ) -> int:
+        cur = self._conn().execute(
+            """
+            INSERT OR REPLACE INTO forecast_attribution (
+                forecast_id, ticker, forecaster, quant_p_yes, adjusted_p_yes,
+                mean_shift_underlying, attribution, dropped
+            ) VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (
+                forecast_id, ticker, forecaster,
+                quant_p_yes, adjusted_p_yes, mean_shift_underlying,
+                json.dumps(attribution, default=str),
+                json.dumps(dropped, default=str),
+            ),
+        )
+        return int(cur.lastrowid or 0)
+
+    def get_attribution_for(self, forecast_id: int) -> dict[str, Any] | None:
+        row = self._conn().execute(
+            "SELECT * FROM forecast_attribution WHERE forecast_id = ?", (forecast_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "forecast_id": row["forecast_id"],
+            "ticker": row["ticker"],
+            "forecaster": row["forecaster"],
+            "quant_p_yes": row["quant_p_yes"],
+            "adjusted_p_yes": row["adjusted_p_yes"],
+            "mean_shift_underlying": row["mean_shift_underlying"],
+            "attribution": json.loads(row["attribution"]) if row["attribution"] else [],
+            "dropped": json.loads(row["dropped"]) if row["dropped"] else [],
+        }
+
     # ------- bulk execute for tests -------------------------------------
     def execute(self, q: str, args: Iterable[Any] = ()) -> sqlite3.Cursor:
         return self._conn().execute(q, tuple(args))
@@ -367,6 +588,12 @@ def _row_to_forecast(row: sqlite3.Row) -> ForecastResult:
         row["underlying_posterior_kind"],
         row["underlying_posterior_params"],
     )
+    # Quant-only columns are new; rows from before the migration won't have
+    # keys. Use ``.keys()`` to guard so old fixtures still round-trip.
+    qo_kind = _row_col(row, "binary_posterior_quant_only_kind")
+    qo_blob = _row_col(row, "binary_posterior_quant_only")
+    qo_params = _row_col(row, "binary_posterior_quant_only_params")
+    quant_only = _storage_to_dist(qo_blob, qo_kind, qo_params) if qo_kind else None
     return ForecastResult(
         ticker=row["ticker"],
         ts=_parse_iso(row["ts"]) or datetime.now(timezone.utc),
@@ -383,4 +610,13 @@ def _row_to_forecast(row: sqlite3.Row) -> ForecastResult:
         },
         diagnostics=json.loads(row["diagnostics"]) if row["diagnostics"] else {},
         null_reason=row["null_reason"],
+        quant_only_binary_posterior=quant_only,
     )
+
+
+def _row_col(row: sqlite3.Row, name: str) -> Any:
+    """Return row[name] or None if the column doesn't exist (pre-migration fixture)."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None

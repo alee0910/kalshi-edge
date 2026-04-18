@@ -197,6 +197,18 @@ class ForecastResult:
     # Rationale: "no fake precision" per project principles.
     null_reason: str | None = None
 
+    # For quantamental forecasters: the quant-only posterior on the binary
+    # outcome, before fundamental inputs were applied. Lets downstream code
+    # (storage, calibration, dashboard) separately track quant-only vs
+    # quant+fundamental forecasts. None for pure-quant forecasters.
+    quant_only_binary_posterior: ForecastDistribution | None = None
+
+    # Attribution log from the integration engine: per-input contribution to
+    # the posterior shift (list of dicts) + dropped-input reasons. Serialized
+    # to JSON for storage; the dashboard renders it as the "fundamental
+    # attribution" section of the audit panel.
+    attribution: dict[str, Any] = field(default_factory=dict)
+
     @property
     def p_yes(self) -> float:
         return self.binary_posterior.mean()
