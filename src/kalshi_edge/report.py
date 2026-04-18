@@ -1,26 +1,22 @@
 """Static HTML report generator.
 
-Renders the current persisted universe (contracts + latest snapshots) as a
-single self-contained HTML page. No JS, no external fonts, no external
-assets — so the output works offline and is safe to host from any static
-server (GitHub Pages, S3, a USB stick).
+Renders the current persisted universe (contracts + latest snapshots +
+latest forecasts) as a single self-contained HTML page. Inline CSS + a
+sliver of inline JS for the category-filter pills. No external assets.
 
-Intentional minimal surface: one public function, ``build_report_html``,
-and a CLI wrapper in ``kalshi_edge.cli``. The scheduler / GitHub Actions
-job pulls the universe first, then calls this.
-
-Forecasts are not yet wired in. The report shows the *universe state*:
-what markets we're watching, their prices, spreads, volumes. Once the
-per-category forecasters land, the report gains edge columns (model p_yes,
-edge vs. market, uncertainty band) — keyed off the same DB, so the
-hosting pipeline doesn't change.
+Rows are sorted by *edge* (model p_yes − market mid, in points)
+descending, so the most YES-underpriced contracts sit at the top and
+the most YES-overpriced (best NO buys) at the bottom. Rows where the
+forecaster abstained or no forecaster exists fall below all
+forecasted rows, sorted by volume — they're not actionable but still
+shown for universe transparency.
 """
 
 from __future__ import annotations
 
 import html
 import sqlite3
-from collections import defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +27,7 @@ from kalshi_edge.storage import Database
 @dataclass(frozen=True, slots=True)
 class _Row:
     ticker: str
+    event_ticker: str
     series_ticker: str
     category: str
     title: str
@@ -52,7 +49,7 @@ class _Row:
 
 _QUERY = """
 SELECT
-    c.ticker, c.series_ticker, c.category, c.title, c.close_time,
+    c.ticker, c.event_ticker, c.series_ticker, c.category, c.title, c.close_time,
     s.yes_bid, s.yes_ask, s.volume_24h, s.liquidity, s.ts AS snapshot_ts,
     f.p_yes AS fc_p_yes, f.p_yes_p05 AS fc_p05, f.p_yes_p95 AS fc_p95,
     f.model_confidence AS fc_model_confidence,
@@ -89,6 +86,7 @@ def _load_rows(db: Database) -> list[_Row]:
     for r in cur.fetchall():
         out.append(_Row(
             ticker=r["ticker"],
+            event_ticker=r["event_ticker"] or "",
             series_ticker=r["series_ticker"] or "",
             category=r["category"] or "other",
             title=r["title"] or "",
@@ -187,26 +185,92 @@ tr:nth-child(even) td { background: var(--row-alt); }
     background: #14181e; border: 1px solid var(--border); border-radius: 8px;
     padding: 12px 16px; color: var(--muted); font-size: 13px; margin-bottom: 24px;
 }
+.filters { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; align-items: center; }
+.filters .lbl { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; margin-right: 6px; }
+.pill {
+    background: var(--card); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 999px; padding: 5px 12px; font-size: 12px; cursor: pointer;
+    font: inherit; font-size: 12px; line-height: 1; letter-spacing: 0.01em;
+}
+.pill:hover { border-color: var(--accent); }
+.pill.active { background: var(--accent); color: #0b0d10; border-color: var(--accent); font-weight: 600; }
+.pill .n { color: var(--muted); margin-left: 6px; font-variant-numeric: tabular-nums; }
+.pill.active .n { color: #0b0d10; opacity: 0.7; }
+.cat-tag {
+    display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--muted); border: 1px solid var(--border); border-radius: 4px;
+    padding: 1px 6px; margin-left: 6px; vertical-align: middle;
+}
 footer { color: var(--muted); font-size: 12px; margin-top: 48px; border-top: 1px solid var(--border); padding-top: 16px; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 """
 
 
-def build_report_html(db: Database, *, now: datetime | None = None,
-                      top_n_per_category: int = 50) -> str:
+_INLINE_JS = """
+(function(){
+  var pills = document.querySelectorAll('.pill');
+  var rows = document.querySelectorAll('tbody tr[data-cat]');
+  function apply(cat){
+    for (var i=0;i<rows.length;i++){
+      var r = rows[i];
+      r.style.display = (cat === 'all' || r.getAttribute('data-cat') === cat) ? '' : 'none';
+    }
+    for (var j=0;j<pills.length;j++){
+      pills[j].classList.toggle('active', pills[j].getAttribute('data-cat') === cat);
+    }
+  }
+  for (var k=0;k<pills.length;k++){
+    pills[k].addEventListener('click', function(e){ apply(e.currentTarget.getAttribute('data-cat')); });
+  }
+})();
+"""
+
+
+def _kalshi_url(r: _Row) -> str:
+    # Kalshi event pages live at /events/{event_ticker}; the ?market= param
+    # pre-selects the specific threshold within the event.
+    if not r.event_ticker:
+        return "https://kalshi.com"
+    return f"https://kalshi.com/events/{r.event_ticker}?market={r.ticker}"
+
+
+def _mid_cents(r: _Row) -> float | None:
+    if r.yes_bid is None or r.yes_ask is None:
+        return None
+    return (r.yes_bid + r.yes_ask) / 2.0
+
+
+def _edge_points(r: _Row) -> float | None:
+    mid = _mid_cents(r)
+    if r.fc_p_yes is None or mid is None:
+        return None
+    return r.fc_p_yes * 100.0 - mid
+
+
+def build_report_html(db: Database, *, now: datetime | None = None) -> str:
     """Render the persisted universe to a single self-contained HTML string."""
     now = now or datetime.now(timezone.utc)
     rows = _load_rows(db)
 
-    by_cat: dict[str, list[_Row]] = defaultdict(list)
-    for r in rows:
-        by_cat[r.category].append(r)
-
     total_mkts = len(rows)
     total_vol = sum(r.volume_24h for r in rows)
-    n_cats = len(by_cat)
+    cat_counts = Counter(r.category for r in rows)
+    n_cats = len(cat_counts)
     fresh_ts = max((r.snapshot_ts for r in rows if r.snapshot_ts), default=None)
+    n_forecasted = sum(1 for r in rows if r.fc_p_yes is not None)
+    n_abstained = sum(1 for r in rows
+                      if r.fc_null_reason is not None and r.fc_p_yes is None)
+
+    # Primary sort key: forecasted rows first (by signed edge DESC), then
+    # abstained/no-forecaster rows (by volume DESC). None edge sorts last.
+    def sort_key(r: _Row) -> tuple[int, float, float]:
+        e = _edge_points(r)
+        if e is None:
+            return (1, 0.0, -r.volume_24h)
+        return (0, -e, -r.volume_24h)
+
+    sorted_rows = sorted(rows, key=sort_key)
 
     parts: list[str] = []
     parts.append(f"<!doctype html><html lang=en><head><meta charset=utf-8>")
@@ -216,21 +280,17 @@ def build_report_html(db: Database, *, now: datetime | None = None,
 
     parts.append("<h1>kalshi-edge — live universe</h1>")
     parts.append("<div class=sub>")
-    parts.append("Contracts currently tracked by the forecasting stack. ")
+    parts.append("Contracts currently tracked by the forecasting stack, sorted by edge. ")
     parts.append(f"Snapshot rendered {html.escape(now.strftime('%Y-%m-%d %H:%M UTC'))}. ")
     if fresh_ts:
         parts.append(f"Latest market data {html.escape(fresh_ts.strftime('%Y-%m-%d %H:%M UTC'))}.")
     parts.append("</div>")
 
-    n_forecasted = sum(1 for r in rows if r.fc_p_yes is not None)
-    n_abstained = sum(1 for r in rows
-                       if r.fc_null_reason is not None and r.fc_p_yes is None)
     parts.append("<div class=notice>")
     parts.append("<b>model p_yes</b> is this system's Bayesian posterior for YES; ")
-    parts.append("<b>edge</b> is model − market (in points). ")
-    parts.append("A <b>[p05, p95]</b> band on model p_yes shows posterior uncertainty. ")
-    parts.append("Categories without a forecaster, or markets where the forecaster ")
-    parts.append("abstained (no fake precision) show no model row.")
+    parts.append("<b>edge</b> is model − market (in points). Positive = model thinks YES is underpriced (buy YES). ")
+    parts.append("Negative = overpriced (buy NO). A <b>[p05, p95]</b> band on model p_yes shows posterior uncertainty. ")
+    parts.append("Markets without an edge (forecaster abstained / not built) show below the actionable rows.")
     parts.append("</div>")
 
     parts.append("<div class=tiles>")
@@ -241,51 +301,63 @@ def build_report_html(db: Database, *, now: datetime | None = None,
     parts.append(f"<div class=tile><div class=lbl>abstained</div><div class=val>{n_abstained:,}</div></div>")
     parts.append("</div>")
 
-    for cat in sorted(by_cat):
-        cat_rows = sorted(by_cat[cat], key=lambda r: r.volume_24h, reverse=True)
-        shown = cat_rows[:top_n_per_category]
-        more = len(cat_rows) - len(shown)
-        more_txt = f" (top {len(shown)} of {len(cat_rows)})" if more > 0 else f" ({len(cat_rows)})"
-        parts.append(f"<h2>{html.escape(cat)}<span class=count>{html.escape(more_txt)}</span></h2>")
-        parts.append("<table><thead><tr>")
-        parts.append("<th>ticker</th><th>title</th>")
-        parts.append("<th class=num>DTE</th>")
-        parts.append("<th class=num>mid</th><th class=num>spread</th>")
-        parts.append("<th class=num>vol 24h</th>")
-        parts.append("<th class=num>model p</th>")
-        parts.append("<th class=num>edge (pts)</th>")
-        parts.append("<th class=num>conf</th>")
-        parts.append("</tr></thead><tbody>")
-        for r in shown:
-            dte = _dte_days(r.close_time, now)
-            mid = None
-            spread = None
-            if r.yes_bid is not None and r.yes_ask is not None:
-                mid = (r.yes_bid + r.yes_ask) / 2
-                spread = r.yes_ask - r.yes_bid
-            parts.append("<tr>")
-            parts.append(f"<td class=ticker>{html.escape(r.ticker)}</td>")
-            parts.append(f"<td class=title title='{html.escape(r.title)}'>{html.escape(r.title)}</td>")
-            parts.append(f"<td class=num>{_fmt_dte(dte)}</td>")
-            parts.append(f"<td class=num>{_fmt_cents(mid)}</td>")
-            parts.append(f"<td class=num>{_fmt_cents(spread)}</td>")
-            parts.append(f"<td class=num>{_fmt_int(r.volume_24h)}</td>")
-            if r.fc_p_yes is not None:
-                ci = ""
-                if r.fc_p05 is not None and r.fc_p95 is not None:
-                    ci = f"<div class=ci>[{_fmt_prob(r.fc_p05)}, {_fmt_prob(r.fc_p95)}]</div>"
-                parts.append(f"<td class=num>{_fmt_prob(r.fc_p_yes)}{ci}</td>")
-                edge_txt, edge_cls = _fmt_edge_points(r.fc_p_yes, mid)
-                parts.append(f"<td class='num edge {edge_cls}'>{edge_txt}</td>")
-                parts.append(f"<td class=num>{_fmt_prob(r.fc_model_confidence)}</td>")
-            elif r.fc_null_reason:
-                parts.append("<td class=num colspan=3><span class=null>"
-                             f"abstained — {html.escape(r.fc_null_reason[:60])}</span></td>")
-            else:
-                parts.append("<td class=num colspan=3><span class=null>no forecaster</span></td>")
-            parts.append("</tr>")
-        parts.append("</tbody></table>")
+    # Filter pills: "all" + one per category (ordered by count DESC).
+    parts.append("<div class=filters>")
+    parts.append("<span class=lbl>filter</span>")
+    parts.append(f"<button class='pill active' data-cat='all'>all<span class=n>{total_mkts}</span></button>")
+    for cat, n in cat_counts.most_common():
+        parts.append(
+            f"<button class='pill' data-cat='{html.escape(cat)}'>"
+            f"{html.escape(cat)}<span class=n>{n}</span></button>"
+        )
+    parts.append("</div>")
 
+    parts.append("<table><thead><tr>")
+    parts.append("<th>ticker</th><th>title</th>")
+    parts.append("<th class=num>DTE</th>")
+    parts.append("<th class=num>mid</th><th class=num>spread</th>")
+    parts.append("<th class=num>vol 24h</th>")
+    parts.append("<th class=num>model p</th>")
+    parts.append("<th class=num>edge (pts)</th>")
+    parts.append("<th class=num>conf</th>")
+    parts.append("</tr></thead><tbody>")
+
+    for r in sorted_rows:
+        dte = _dte_days(r.close_time, now)
+        mid = _mid_cents(r)
+        spread = None
+        if r.yes_bid is not None and r.yes_ask is not None:
+            spread = r.yes_ask - r.yes_bid
+        cat_attr = html.escape(r.category)
+        parts.append(f"<tr data-cat='{cat_attr}'>")
+        parts.append(
+            f"<td class=ticker>"
+            f"<a href='{html.escape(_kalshi_url(r))}' target=_blank rel=noopener>"
+            f"{html.escape(r.ticker)}</a>"
+            f"<span class=cat-tag>{cat_attr}</span></td>"
+        )
+        parts.append(f"<td class=title title='{html.escape(r.title)}'>{html.escape(r.title)}</td>")
+        parts.append(f"<td class=num>{_fmt_dte(dte)}</td>")
+        parts.append(f"<td class=num>{_fmt_cents(mid)}</td>")
+        parts.append(f"<td class=num>{_fmt_cents(spread)}</td>")
+        parts.append(f"<td class=num>{_fmt_int(r.volume_24h)}</td>")
+        if r.fc_p_yes is not None:
+            ci = ""
+            if r.fc_p05 is not None and r.fc_p95 is not None:
+                ci = f"<div class=ci>[{_fmt_prob(r.fc_p05)}, {_fmt_prob(r.fc_p95)}]</div>"
+            parts.append(f"<td class=num>{_fmt_prob(r.fc_p_yes)}{ci}</td>")
+            edge_txt, edge_cls = _fmt_edge_points(r.fc_p_yes, mid)
+            parts.append(f"<td class='num edge {edge_cls}'>{edge_txt}</td>")
+            parts.append(f"<td class=num>{_fmt_prob(r.fc_model_confidence)}</td>")
+        elif r.fc_null_reason:
+            parts.append("<td class=num colspan=3><span class=null>"
+                         f"abstained — {html.escape(r.fc_null_reason[:80])}</span></td>")
+        else:
+            parts.append("<td class=num colspan=3><span class=null>no forecaster</span></td>")
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+
+    parts.append(f"<script>{_INLINE_JS}</script>")
     parts.append("<footer>")
     parts.append("kalshi-edge · research-grade Kalshi mispricing detector · ")
     parts.append("price data via <a href='https://kalshi.com'>Kalshi public API</a>. ")
