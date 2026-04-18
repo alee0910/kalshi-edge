@@ -1,0 +1,91 @@
+# kalshi-edge default configuration.
+# Override per-environment by setting KALSHI_EDGE_CONFIG to a different YAML.
+# Env vars override individual fields where noted.
+
+kalshi:
+  base_url: "https://api.elections.kalshi.com/trade-api/v2"
+  # Conservative unauthenticated rate; raise once we have an API key with higher tier.
+  requests_per_second: 5.0
+  # Bound how hard we retry transient 5xx / 429.
+  max_retries: 5
+  retry_backoff_seconds: 1.5
+  # requests-cache TTLs. Orderbook is near-real-time so TTL is short.
+  cache_ttl:
+    markets_list: 60
+    market_detail: 60
+    orderbook: 5
+    event_detail: 300
+    series_detail: 3600
+
+universe_filter:
+  # Days-to-expiry lower bound. Weather contracts live 0-3 days; NWP skill is
+  # highest in that window, so a 7-day floor was wrong. Just exclude markets
+  # that are effectively already settled (<~3h).
+  min_dte_days: 0.1
+  # Volume proxy — Kalshi reports contract volume in integer contracts, not $.
+  # Empirically real Kalshi markets have 24h-volume in the tens-to-thousands;
+  # 500 was miscalibrated against non-parlay reality.
+  min_volume: 50
+  # Max YES bid-ask spread in cents. 15c still tradeable for large edges;
+  # tighter filtering happens per-forecaster based on expected edge magnitude.
+  max_spread_cents: 15
+  # Only surface markets we have a forecaster for. Categories derived from
+  # series-ticker prefixes in categories.yaml.
+  allowed_categories:
+    - weather
+    - economics
+    - rates
+    - sports
+    - politics
+  # Status filter.
+  status: "open"
+
+storage:
+  sqlite_path: "./data/kalshi_edge.db"
+  # Separate directory for large posterior-sample blobs referenced from sqlite.
+  samples_dir: "./data/samples"
+  # Enable WAL for concurrent readers during scheduler runs.
+  wal_mode: true
+
+scheduler:
+  market_refresh_minutes: 15
+  forecast_refresh_minutes: 60
+  calibration_refresh_hours: 24
+  digest_cron: "0 7 * * *"   # 07:00 ET; the scheduler wires TZ="America/New_York"
+  timezone: "America/New_York"
+
+ranker:
+  # Bankroll used for Kelly-sizing. Override in .env for real sizing.
+  bankroll_dollars: 10000
+  kelly_fraction: 0.25
+  # Real-time alert thresholds.
+  alert_edge_points: 15.0
+  alert_model_confidence: 0.7
+  # Kalshi fee schedule. Source: kalshi.com/docs/trading/fees
+  # Round-trip fee is applied per-winning-contract as ceil(0.07 * C * P * (1-P))
+  # where C = contracts, P = price as decimal. We bake this into EV below.
+  # Keep configurable so schedule changes don't require a code change.
+  fee_model: "kalshi_default_v1"
+  # Correlation penalty: soft haircut when a new position is highly correlated
+  # with an existing one. Implemented in ranker/portfolio.py.
+  correlation_penalty_lambda: 0.25
+
+calibration:
+  # Minimum resolved forecasts before we trust a reliability curve per category.
+  min_resolved_for_reliability: 30
+  # Reliability binning.
+  reliability_bins: 10
+  # Isotonic-regression refit cadence (days).
+  isotonic_refit_days: 7
+
+alerts:
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 587
+  use_tls: true
+  # Digest top-N. Realtime alerts ignore this and fire per-contract.
+  digest_top_n: 5
+
+logging:
+  level: "INFO"
+  # structlog renders JSON in prod, console in dev.
+  renderer: "console"

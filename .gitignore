@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# uv
+.uv-cache/
+
+# Tests / linters
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Env / secrets
+.env
+.env.local
+*.pem
+secrets/
+keys/
+
+# Data & caches
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/cache/
+data/samples/
+data/blobs/
+*.parquet.bak
+
+# JAX
+.jax_cache/
+
+# Generated static report (rebuilt by CI)
+site/

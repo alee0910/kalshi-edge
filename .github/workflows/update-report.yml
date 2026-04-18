@@ -1,0 +1,82 @@
+name: update-report
+
+# Refreshes the static Kalshi universe report on a cron and publishes to GitHub Pages.
+#
+# Public Kalshi endpoints don't need auth, so this workflow needs no secrets.
+# The only state that persists between runs is the HTML artifact itself —
+# the SQLite DB is rebuilt fresh inside the runner each time (small, fast,
+# avoids the complexity of committing a binary).
+
+on:
+  schedule:
+    # every 30 min. Cron on GitHub Actions is best-effort: runs may be
+    # delayed under load. That's fine for a universe snapshot.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}   # allow manual "rebuild now" from the Actions UI
+  push:
+    branches: [main]      # also rebuild whenever code / config changes
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.10
+
+      - name: Sync deps
+        run: uv sync --frozen || uv sync
+
+      - name: Init DB
+        run: uv run kalshi-edge init-db
+
+      - name: Pull universe (targeted series)
+        # Targeted series list beats a full scan: Kalshi's open-markets feed
+        # is dominated by MV parlay aggregates that we skip anyway.
+        run: |
+          uv run kalshi-edge pull-universe \
+            --series "KXHIGHNY,KXHIGHLAX,KXHIGHCHI,KXHIGHMIA,KXHIGHAUS,KXHIGHDEN,KXHIGHPHIL,KXHIGHPHX,KXCPIYOY,KXCPI,KXFED,KXFEDDECISION,KXNBAGAME,KXNHL,KXATPMATCH,KXMLBGAME"
+
+      - name: Run forecasters
+        # Weather → Open-Meteo (public, no key). Economics → FRED (key optional:
+        # if repo secret FRED_API_KEY is set, CPI markets get forecasted;
+        # otherwise they abstain with an explicit reason). Other categories
+        # abstain — "no fake precision" per project methodology.
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: uv run kalshi-edge forecast
+
+      - name: Build HTML report
+        run: uv run kalshi-edge build-report --out site/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

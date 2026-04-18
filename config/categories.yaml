@@ -1,0 +1,92 @@
+# Mapping from Kalshi series-ticker prefix to our internal category.
+# Used by market/universe.py to decide which forecaster (if any) owns a contract.
+#
+# Kalshi organizes markets under series (e.g. "KXHIGHNY") -> events -> markets.
+# Series tickers are stable identifiers we can dispatch on without parsing titles.
+#
+# This list is hand-maintained. When a new category of contract appears on Kalshi,
+# either add its prefix here, or extend market/universe.py::infer_category.
+# Prefixes are checked longest-first so more-specific prefixes win.
+
+weather:
+  series_prefixes:
+    - KXHIGH       # Daily high temperature at a station
+    - KXLOW        # Daily low temperature
+    - KXTEMP       # Generic temperature contracts
+    - KXSNOW       # Seasonal / event snowfall
+    - KXRAIN       # Rainfall
+    - KXHUR        # Hurricane / named storm
+    - KXATLHUR     # Atlantic hurricane season count
+  title_keywords:
+    - "temperature"
+    - "snowfall"
+    - "rainfall"
+    - "hurricane"
+
+economics:
+  series_prefixes:
+    - KXCPI        # CPI YoY / MoM
+    - KXCPIM       # CPI monthly
+    - KXPCE
+    - KXPCEY
+    - KXNFP        # Nonfarm payrolls
+    - KXUNRATE     # Unemployment rate
+    - KXGDP
+    - KXRETAIL
+    - KXPPI
+    - KXJOBLESS
+  title_keywords:
+    - "CPI"
+    - "PCE"
+    - "nonfarm payrolls"
+    - "unemployment"
+    - "retail sales"
+
+rates:
+  series_prefixes:
+    - KXFED
+    - KXFEDDECISION
+    - KXFEDFUNDS
+    - KXSOFR
+  title_keywords:
+    - "federal funds"
+    - "Fed decision"
+    - "FOMC"
+
+sports:
+  series_prefixes:
+    - KXNBA
+    - KXNFL
+    - KXMLB
+    - KXNHL
+    - KXATP
+    - KXWTA
+    - KXEPL
+    - KXUCL
+    - KXCFB
+    - KXCBB
+  title_keywords: []   # sports titles are too noisy; prefer prefix match
+
+politics:
+  series_prefixes:
+    - KXPRES
+    - KXSEN
+    - KXHOUSE
+    - KXGOV
+    - KXELECT
+    - KXPRIMARY
+  title_keywords:
+    - "election"
+    - "primary"
+
+earnings:
+  # Currently unsupported; included so we can filter them OUT of the universe
+  # rather than misclassify them.
+  series_prefixes:
+    - KXEPS
+    - KXREV
+    - KXEARN
+  title_keywords:
+    - "earnings"
+    - "revenue"
+    - "EPS"
