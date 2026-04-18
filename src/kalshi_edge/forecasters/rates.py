@@ -62,7 +62,12 @@ class FedContract:
 
 
 def parse_fed_contract(series_ticker: str, event_ticker: str) -> FedContract | None:
-    if not series_ticker.upper().startswith("KXFED"):
+    # Polymarket's FOMC markets resolve on the press-release decision, which
+    # is the same event Kalshi's KXFEDDECISION series resolves on. The
+    # sibling KXFED series (end-of-month rate-level markets) asks a
+    # different question that Polymarket doesn't offer a counterpart for,
+    # so we deliberately don't support it here.
+    if series_ticker.upper() != "KXFEDDECISION":
         return None
     m = _EVENT_MONTH_RE.search(event_ticker or "")
     if not m:
