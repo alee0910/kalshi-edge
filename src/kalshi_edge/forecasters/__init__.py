@@ -13,9 +13,9 @@ from kalshi_edge.forecasters.base import (
     default_registry,
 )
 from kalshi_edge.forecasters.economics import EconomicsCPIForecaster
-from kalshi_edge.forecasters.politics import PoliticsAbstainForecaster
-from kalshi_edge.forecasters.rates import RatesAbstainForecaster
-from kalshi_edge.forecasters.sports import SportsAbstainForecaster
+from kalshi_edge.forecasters.politics import PoliticsCrossMarketForecaster
+from kalshi_edge.forecasters.rates import RatesFOMCForecaster
+from kalshi_edge.forecasters.sports import SportsOddsForecaster
 from kalshi_edge.forecasters.weather import WeatherForecaster
 
 
@@ -24,9 +24,9 @@ def build_default_registry() -> ForecasterRegistry:
     reg = ForecasterRegistry()
     reg.register(WeatherForecaster())
     reg.register(EconomicsCPIForecaster())
-    reg.register(RatesAbstainForecaster())
-    reg.register(SportsAbstainForecaster())
-    reg.register(PoliticsAbstainForecaster())
+    reg.register(RatesFOMCForecaster())
+    reg.register(SportsOddsForecaster())
+    reg.register(PoliticsCrossMarketForecaster())
     return reg
 
 
@@ -38,7 +38,7 @@ __all__ = [
     "build_default_registry",
     "WeatherForecaster",
     "EconomicsCPIForecaster",
-    "RatesAbstainForecaster",
-    "SportsAbstainForecaster",
-    "PoliticsAbstainForecaster",
+    "RatesFOMCForecaster",
+    "SportsOddsForecaster",
+    "PoliticsCrossMarketForecaster",
 ]

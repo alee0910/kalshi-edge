@@ -1,0 +1,113 @@
+"""Tests for sports contract parsing + odds-api game matching + devigging."""
+
+from __future__ import annotations
+
+from datetime import date, datetime, timezone
+
+import pytest
+
+from kalshi_edge.data_sources.the_odds_api import (
+    BookOutcome,
+    Game,
+    SERIES_TO_SPORT,
+    devig_book,
+)
+from kalshi_edge.forecasters.sports_rules import (
+    match_game,
+    parse_sports_contract,
+)
+
+
+def test_parse_sports_contract_mlb() -> None:
+    sc = parse_sports_contract("KXMLBGAME", "KXMLBGAME-26APR181605CWSATH")
+    assert sc is not None
+    assert sc.sport_key == "baseball_mlb"
+    assert sc.target_date == date(2026, 4, 18)
+
+
+def test_parse_sports_contract_unknown_series() -> None:
+    assert parse_sports_contract("KXATPMATCH", "KXATPMATCH-26MAR03-XY") is None
+
+
+def test_parse_sports_contract_bad_date() -> None:
+    assert parse_sports_contract("KXNBAGAME", "KXNBAGAME-99XXX01LAC") is None
+
+
+def _game(home: str, away: str, on: date) -> Game:
+    return Game(
+        sport_key="baseball_mlb",
+        game_id="g1",
+        commence_time=datetime(on.year, on.month, on.day, 20, 0, tzinfo=timezone.utc),
+        home_team=home,
+        away_team=away,
+        outcomes=[],
+        fetched_at=datetime.now(timezone.utc),
+    )
+
+
+def test_match_game_picks_yes_team_by_position() -> None:
+    sc = parse_sports_contract("KXMLBGAME", "KXMLBGAME-26APR181605CWSATH")
+    assert sc is not None
+    games = [_game("Chicago White Sox", "Oakland Athletics", date(2026, 4, 18))]
+    res = match_game(sc, "Will the White Sox beat the Athletics?", games)
+    assert res is not None
+    g, team = res
+    assert team == "Chicago White Sox"  # earlier mention wins
+
+
+def test_match_game_away_team_first() -> None:
+    sc = parse_sports_contract("KXMLBGAME", "KXMLBGAME-26APR181605CWSATH")
+    assert sc is not None
+    games = [_game("Chicago White Sox", "Oakland Athletics", date(2026, 4, 18))]
+    res = match_game(sc, "Will the Athletics beat the White Sox?", games)
+    assert res is not None
+    _, team = res
+    assert team == "Oakland Athletics"
+
+
+def test_match_game_date_mismatch_returns_none() -> None:
+    sc = parse_sports_contract("KXMLBGAME", "KXMLBGAME-26APR181605CWSATH")
+    assert sc is not None
+    games = [_game("Chicago White Sox", "Oakland Athletics", date(2026, 4, 19))]
+    assert match_game(sc, "Will the White Sox win?", games) is None
+
+
+def test_match_game_ambiguous_same_city() -> None:
+    sc = parse_sports_contract("KXMLBGAME", "KXMLBGAME-26APR181605CWSATH")
+    assert sc is not None
+    games = [
+        _game("Chicago White Sox", "Oakland Athletics", date(2026, 4, 18)),
+        _game("Chicago Cubs", "Los Angeles Dodgers", date(2026, 4, 18)),
+    ]
+    # "Chicago" hits both — we abstain.
+    assert match_game(sc, "Will Chicago win?", games) is None
+
+
+def test_devig_book_symmetric() -> None:
+    # Two even-money outcomes at 1.91 each -> ~52.36% implied each -> devig to 50/50.
+    out = devig_book({"A": 1.91, "B": 1.91})
+    assert out["A"] == pytest.approx(0.5, abs=1e-9)
+    assert out["B"] == pytest.approx(0.5, abs=1e-9)
+
+
+def test_devig_book_asymmetric() -> None:
+    # Favorite at 1.50 (66.67%), dog at 3.00 (33.33%). Sum = 100%: already fair, devig = identity.
+    out = devig_book({"A": 1.50, "B": 3.00})
+    assert out["A"] == pytest.approx(2 / 3, abs=1e-9)
+    assert out["B"] == pytest.approx(1 / 3, abs=1e-9)
+
+
+def test_devig_book_with_vig() -> None:
+    # 2.00 / 2.00 has 100% implied, 1.90/1.90 has more — same fair 50/50 after devig.
+    out = devig_book({"A": 1.90, "B": 1.90})
+    assert out["A"] == pytest.approx(0.5, abs=1e-9)
+
+
+def test_devig_book_drops_nonpositive() -> None:
+    assert devig_book({"A": 0.0, "B": 2.0}) == {"B": pytest.approx(1.0)}
+
+
+def test_series_to_sport_keys_stable() -> None:
+    assert SERIES_TO_SPORT["KXNBAGAME"] == "basketball_nba"
+    assert SERIES_TO_SPORT["KXMLBGAME"] == "baseball_mlb"
+    assert SERIES_TO_SPORT["KXNHL"] == "icehockey_nhl"

@@ -51,15 +51,17 @@ jobs:
         # is dominated by MV parlay aggregates that we skip anyway.
         run: |
           uv run kalshi-edge pull-universe \
-            --series "KXHIGHNY,KXHIGHLAX,KXHIGHCHI,KXHIGHMIA,KXHIGHAUS,KXHIGHDEN,KXHIGHPHIL,KXHIGHPHX,KXCPIYOY,KXCPI,KXFED,KXFEDDECISION,KXNBAGAME,KXNHL,KXATPMATCH,KXMLBGAME"
+            --series "KXHIGHNY,KXHIGHLAX,KXHIGHCHI,KXHIGHMIA,KXHIGHAUS,KXHIGHDEN,KXHIGHPHIL,KXHIGHPHX,KXCPIYOY,KXCPI,KXFED,KXFEDDECISION,KXNBAGAME,KXNHL,KXATPMATCH,KXMLBGAME,KXPRES,KXSEN,KXHOUSE,KXGOV,KXELECT,KXPRIMARY"
 
       - name: Run forecasters
-        # Weather → Open-Meteo (public, no key). Economics → FRED (key optional:
-        # if repo secret FRED_API_KEY is set, CPI markets get forecasted;
-        # otherwise they abstain with an explicit reason). Other categories
-        # abstain — "no fake precision" per project methodology.
+        # Weather → Open-Meteo (public). Economics → FRED. Sports → the-odds-api
+        # (bookmaker ensemble). Rates → Polymarket FOMC cross-market prior.
+        # Politics → Polymarket cross-market prior. Each forecaster abstains
+        # with an explicit reason when its data source or a match is missing,
+        # per the project "no fake precision" rule.
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
         run: uv run kalshi-edge forecast
 
       - name: Build HTML report
