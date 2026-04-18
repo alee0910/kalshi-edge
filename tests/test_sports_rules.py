@@ -10,6 +10,7 @@ from kalshi_edge.data_sources.the_odds_api import (
     BookOutcome,
     Game,
     SERIES_TO_SPORT,
+    TheOddsAPIClient,
     devig_book,
 )
 from kalshi_edge.forecasters.sports_rules import (
@@ -154,6 +155,53 @@ def test_devig_book_with_vig() -> None:
 
 def test_devig_book_drops_nonpositive() -> None:
     assert devig_book({"A": 0.0, "B": 2.0}) == {"B": pytest.approx(1.0)}
+
+
+def test_h2h_odds_uses_events_then_per_event_and_filters_by_commence() -> None:
+    """Client should list events, then pull per-event odds only for events
+    that commence on/before the window; far-future events are skipped so
+    we don't pay quota for games Kalshi isn't trading today."""
+    client = TheOddsAPIClient(api_key="k")
+    calls: list[tuple[str, dict[str, str]]] = []
+
+    def fake_get(path: str, params: dict[str, str]) -> object:
+        calls.append((path, dict(params)))
+        if path == "/sports/baseball_mlb/events":
+            return [
+                {"id": "e1", "commence_time": "2026-04-18T23:00:00Z",
+                 "home_team": "Chicago White Sox", "away_team": "Oakland Athletics"},
+                {"id": "e2", "commence_time": "2026-04-25T23:00:00Z",
+                 "home_team": "Toronto Blue Jays", "away_team": "Detroit Tigers"},
+            ]
+        if path == "/sports/baseball_mlb/events/e1/odds":
+            return {
+                "id": "e1", "commence_time": "2026-04-18T23:00:00Z",
+                "home_team": "Chicago White Sox", "away_team": "Oakland Athletics",
+                "bookmakers": [
+                    {"key": "fanduel", "markets": [
+                        {"key": "h2h", "outcomes": [
+                            {"name": "Chicago White Sox", "price": 1.83},
+                            {"name": "Oakland Athletics", "price": 2.05},
+                        ]},
+                    ]},
+                ],
+            }
+        raise AssertionError(f"unexpected call: {path}")
+
+    client._get = fake_get  # type: ignore[assignment]
+    commence_before = datetime(2026, 4, 20, 0, 0, tzinfo=timezone.utc)
+    games = client.h2h_odds("baseball_mlb", commence_before=commence_before)
+
+    paths = [c[0] for c in calls]
+    assert paths == [
+        "/sports/baseball_mlb/events",
+        "/sports/baseball_mlb/events/e1/odds",
+    ], f"expected exactly one per-event odds call (e1), got: {paths}"
+    assert len(games) == 1
+    assert games[0].game_id == "e1"
+    assert games[0].home_team == "Chicago White Sox"
+    assert len(games[0].outcomes) == 2
+    assert games[0].outcomes[0].bookmaker == "fanduel"
 
 
 def test_series_to_sport_keys_stable() -> None:

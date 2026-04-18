@@ -33,7 +33,7 @@ The forecaster abstains (with an explicit reason) when:
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 import numpy as np
 
@@ -66,7 +66,10 @@ class SportsOddsForecaster(Forecaster):
         rng: np.random.Generator | None = None,
     ) -> None:
         self.client = client  # may be None; we resolve lazily on first forecast
-        self._game_cache: dict[str, list[Game]] = {}
+        # Cache is keyed by (sport_key, target_date.isoformat()) so we reuse
+        # the events+odds fetch across all contracts for the same sport/day
+        # within one forecast run, but refetch when we hit the next day.
+        self._game_cache: dict[tuple[str, str], list[Game]] = {}
         self.rng = rng or np.random.default_rng(seed=0xD00D1E)
 
     @property
@@ -94,7 +97,7 @@ class SportsOddsForecaster(Forecaster):
                 )
             self.client = TheOddsAPIClient(key)
 
-        games = self._games_for(sc.sport_key)
+        games = self._games_for(sc.sport_key, sc.target_date)
         if not games:
             return self._null(contract, f"no odds-api games for {sc.sport_key}")
 
@@ -146,13 +149,23 @@ class SportsOddsForecaster(Forecaster):
         )
 
     # ---- internals ------------------------------------------------------
-    def _games_for(self, sport_key: str) -> list[Game]:
-        cached = self._game_cache.get(sport_key)
+    def _games_for(self, sport_key: str, target_date: date) -> list[Game]:
+        key = (sport_key, target_date.isoformat())
+        cached = self._game_cache.get(key)
         if cached is not None:
             return cached
         assert self.client is not None
-        games = self.client.h2h_odds(sport_key)
-        self._game_cache[sport_key] = games
+        # Cap per-event quota spend: Kalshi's ticker date is the game's
+        # ET-local calendar day, which in UTC can land anywhere from the
+        # same morning (early East-coast games) to +1 day (late-night West
+        # Coast games). Fetching through target_date + 2 days UTC covers
+        # every same-day game with a safety margin, and keeps us from
+        # paying for odds on games a week out that Kalshi isn't trading yet.
+        commence_before = datetime.combine(
+            target_date + timedelta(days=2), time(0, 0), tzinfo=timezone.utc,
+        )
+        games = self.client.h2h_odds(sport_key, commence_before=commence_before)
+        self._game_cache[key] = games
         return games
 
     def _devig_per_book(self, game: Game, target_team: str) -> dict[str, float]:

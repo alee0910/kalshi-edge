@@ -8,9 +8,18 @@ gives that book's fair-odds estimate. We then carry the set of per-book
 devigged probabilities forward as samples — the weather forecaster's
 Bayesian bootstrap is exactly analogous.
 
+Endpoint choice — `/events` + per-event `/events/{id}/odds` rather than
+bulk `/sports/{sport}/odds`. The bulk h2h endpoint drops a game from its
+response the moment it goes in-play, which left Kalshi's still-open
+post-tip-off markets un-priced. The events endpoint keeps listing every
+scheduled and in-progress game until it settles, so we can price across
+the full tradeable window. Cost: one list call + N per-event calls per
+sport per refresh (N ≈ same-day scheduled games), which is fine on a
+paid plan but would blow the free tier's 500/mo — hence the commence-time
+filter at the call site to cap N.
+
 Caching: 15 min TTL. Pre-game moneylines move slowly; within-minute
-refresh is wasted quota. The free tier is 500 req/month so aggressive
-caching also protects the key.
+refresh is wasted quota. Per-event URLs cache individually.
 
 Sport keys we target (stable keys from the-odds-api docs):
     basketball_nba, icehockey_nhl, baseball_mlb
@@ -22,7 +31,7 @@ here; the sports forecaster abstains on ATP for v1.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -100,45 +109,73 @@ class TheOddsAPIClient:
         r.raise_for_status()
         return r.json()
 
-    def h2h_odds(self, sport_key: str) -> list[Game]:
-        """Moneyline (head-to-head) odds for every currently-upcoming game
-        in a sport. Returns [] if none are in the API window."""
+    def list_events(self, sport_key: str) -> list[dict[str, Any]]:
+        """List every scheduled + in-progress game. No odds payload — cheap,
+        one quota call. Returns raw event dicts as-is from the API."""
+        raw = self._get(f"/sports/{sport_key}/events", params={})
+        if not isinstance(raw, list):
+            log.warning("odds_api_events_unexpected_shape", sport=sport_key)
+            return []
+        return raw
+
+    def event_odds(self, sport_key: str, event_id: str) -> dict[str, Any] | None:
+        """Per-event h2h odds. Survives through in-play, unlike the bulk
+        ``/sports/{sport}/odds`` endpoint."""
         raw = self._get(
-            f"/sports/{sport_key}/odds",
+            f"/sports/{sport_key}/events/{event_id}/odds",
             params={"regions": "us", "markets": "h2h", "oddsFormat": "decimal"},
         )
-        if not isinstance(raw, list):
-            log.warning("odds_api_unexpected_shape", sport=sport_key)
+        if not isinstance(raw, dict):
+            log.warning("odds_api_event_odds_unexpected_shape",
+                        sport=sport_key, event_id=event_id)
+            return None
+        return raw
+
+    def h2h_odds(
+        self, sport_key: str, *, commence_before: datetime | None = None,
+    ) -> list[Game]:
+        """Moneyline (head-to-head) odds for every game scheduled or in-play
+        on ``sport_key``, via the events + per-event-odds flow.
+
+        ``commence_before`` caps per-event quota spend: events that tip off
+        after this UTC datetime are skipped (their odds aren't fetched).
+        Pass a generous window (e.g. target_date + 2 days) to stay under
+        paid-tier quota while still covering day-of trading.
+        """
+        events = self.list_events(sport_key)
+        if not events:
             return []
         now = datetime.utcnow().replace(microsecond=0)
         games: list[Game] = []
-        for g in raw:
+        for ev in events:
             try:
-                outs: list[BookOutcome] = []
-                for book in g.get("bookmakers", []):
-                    bname = book.get("key") or book.get("title") or "unknown"
-                    for mkt in book.get("markets", []):
-                        if mkt.get("key") != "h2h":
-                            continue
-                        for o in mkt.get("outcomes", []):
-                            team = str(o.get("name") or "")
-                            price = o.get("price")
-                            if not team or price is None:
-                                continue
-                            try:
-                                outs.append(BookOutcome(
-                                    bookmaker=str(bname),
-                                    team=team,
-                                    decimal_price=float(price),
-                                ))
-                            except (TypeError, ValueError):
-                                continue
+                event_id = str(ev.get("id") or "")
+                if not event_id:
+                    continue
+                commence = _parse_iso(ev.get("commence_time"))
+                if commence_before is not None:
+                    c_cmp = commence
+                    if c_cmp.tzinfo is None:
+                        c_cmp = c_cmp.replace(tzinfo=timezone.utc)
+                    ref = commence_before
+                    if ref.tzinfo is None:
+                        ref = ref.replace(tzinfo=timezone.utc)
+                    if c_cmp > ref:
+                        continue
+                payload = self.event_odds(sport_key, event_id)
+                if payload is None:
+                    continue
+                outs = _parse_bookmaker_outcomes(payload.get("bookmakers", []))
                 games.append(Game(
                     sport_key=sport_key,
-                    game_id=str(g.get("id") or ""),
-                    commence_time=_parse_iso(g.get("commence_time")),
-                    home_team=str(g.get("home_team") or ""),
-                    away_team=str(g.get("away_team") or ""),
+                    game_id=event_id,
+                    commence_time=commence,
+                    home_team=str(
+                        payload.get("home_team") or ev.get("home_team") or ""
+                    ),
+                    away_team=str(
+                        payload.get("away_team") or ev.get("away_team") or ""
+                    ),
                     outcomes=outs,
                     fetched_at=now,
                 ))
@@ -146,6 +183,29 @@ class TheOddsAPIClient:
                 log.warning("odds_api_game_parse_failed", error=str(e))
                 continue
         return games
+
+
+def _parse_bookmaker_outcomes(books: list[dict[str, Any]]) -> list[BookOutcome]:
+    outs: list[BookOutcome] = []
+    for book in books:
+        bname = book.get("key") or book.get("title") or "unknown"
+        for mkt in book.get("markets", []):
+            if mkt.get("key") != "h2h":
+                continue
+            for o in mkt.get("outcomes", []):
+                team = str(o.get("name") or "")
+                price = o.get("price")
+                if not team or price is None:
+                    continue
+                try:
+                    outs.append(BookOutcome(
+                        bookmaker=str(bname),
+                        team=team,
+                        decimal_price=float(price),
+                    ))
+                except (TypeError, ValueError):
+                    continue
+    return outs
 
 
 def _parse_iso(s: Any) -> datetime:
