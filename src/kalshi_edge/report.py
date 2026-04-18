@@ -824,7 +824,6 @@ def _build_detail_html(r: _Row, mid: float | None) -> str:
         + "".join(pricing_lines)
         + "</div>"
         + narrative_block
-        + _fundamental_attribution_block(r)
         + "<div class=detail-section><div class=detail-h>How this edge was computed</div>"
         + _kv_block(r.fc_methodology)
         + "</div>"
@@ -965,13 +964,6 @@ def build_report_html(db: Database, *, now: datetime | None = None) -> str:
     parts.append(f"<style>{_CSS}</style></head><body><div class=wrap>")
 
     parts.append("<h1>kalshi-edge — live universe</h1>")
-    parts.append(
-        "<div class=nav-sub>"
-        "<a href='./index.html'>Universe</a>"
-        "<a href='./research_queue.html'>Research queue</a>"
-        "<a href='./calibration_split.html'>Calibration split</a>"
-        "</div>"
-    )
     parts.append("<div class=sub>")
     parts.append("Contracts currently tracked by the forecasting stack, sorted by edge. ")
     parts.append(f"Snapshot rendered {html.escape(now.strftime('%Y-%m-%d %H:%M UTC'))}. ")
@@ -1171,18 +1163,25 @@ def build_report_html(db: Database, *, now: datetime | None = None) -> str:
     return "".join(parts)
 
 
-def _page_shell(title: str, body: str, *, now: datetime) -> str:
-    """Wrap a body fragment in the same chrome as the main universe page."""
+def _quantamental_page_shell(title: str, body: str, *, now: datetime) -> str:
+    """Wrap a body fragment in chrome for the /quantamental/ subsite.
+
+    Links are relative and resolve within the subdir. The ``../`` link back
+    to the universe assumes the quantamental subsite lives one level below
+    the main page (site/ layout: ``/index.html`` + ``/quantamental/*``).
+    """
     return (
         "<!doctype html><html lang=en><head><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
-        f"<title>{html.escape(title)} — kalshi-edge</title>"
+        f"<title>{html.escape(title)} — kalshi-edge quantamental</title>"
         f"<style>{_CSS}</style></head><body><div class=wrap>"
-        f"<h1>{html.escape(title)}</h1>"
+        f"<h1>kalshi-edge — quantamental · {html.escape(title)}</h1>"
         "<div class=nav-sub>"
-        "<a href='./index.html'>Universe</a>"
+        "<a href='./index.html'>Overview</a>"
         "<a href='./research_queue.html'>Research queue</a>"
         "<a href='./calibration_split.html'>Calibration split</a>"
+        "<a href='./briefs/'>Briefs</a>"
+        "<a href='../index.html'>← Universe</a>"
         "</div>"
         + body
         + "<footer>"
@@ -1287,7 +1286,7 @@ def build_research_queue_html(db: Database, *, now: datetime | None = None) -> s
             "expected input is live and calibrated, or no forecaster has run "
             "yet.</div>"
         )
-        return _page_shell("Research queue", "".join(body), now=now)
+        return _quantamental_page_shell("Research queue", "".join(body), now=now)
 
     body.append(
         "<table><thead><tr>"
@@ -1321,7 +1320,7 @@ def build_research_queue_html(db: Database, *, now: datetime | None = None) -> s
             f"</tr>"
         )
     body.append("</tbody></table>")
-    return _page_shell("Research queue", "".join(body), now=now)
+    return _quantamental_page_shell("Research queue", "".join(body), now=now)
 
 
 def _fmt_name_list(names: tuple[str, ...]) -> str:
@@ -1389,7 +1388,7 @@ def build_calibration_split_html(db: Database, *, now: datetime | None = None) -
             "<div class=notice>No calibration records yet. This page fills "
             "in once forecasts start resolving.</div>"
         )
-        return _page_shell("Calibration split", "".join(body), now=now)
+        return _quantamental_page_shell("Calibration split", "".join(body), now=now)
 
     body.append(
         "<table><thead><tr>"
@@ -1422,32 +1421,148 @@ def build_calibration_split_html(db: Database, *, now: datetime | None = None) -
             f"</tr>"
         )
     body.append("</tbody></table>")
-    return _page_shell("Calibration split", "".join(body), now=now)
+    return _quantamental_page_shell("Calibration split", "".join(body), now=now)
 
 
-def write_report(
+def write_report(db: Database, out_path: Path, *, now: datetime | None = None) -> int:
+    """Render and write the universe page. Returns bytes written."""
+    html_out = build_report_html(db, now=now)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    return out_path.write_text(html_out, encoding="utf-8")
+
+
+def build_quantamental_index_html(db: Database, *, now: datetime | None = None) -> str:
+    """Landing page for the /quantamental/ subsite.
+
+    Explains what the subsite is, summarizes the live fundamental-input
+    stock by category, and links out to the analytical pages. Intentionally
+    sparse — the per-contract attribution lives in the Markdown briefs and
+    the research queue.
+    """
+    now = now or datetime.now(timezone.utc)
+
+    cur = db.execute(
+        """
+        SELECT category, COUNT(*) AS n,
+               SUM(CASE WHEN expires_at IS NULL OR expires_at > ? THEN 1 ELSE 0 END) AS n_live
+        FROM fundamental_inputs
+        GROUP BY category
+        ORDER BY category
+        """,
+        (now.isoformat(),),
+    )
+    input_rows = list(cur.fetchall())
+
+    cur = db.execute(
+        """
+        SELECT name, MAX(fit_at) AS fit_at, beta, beta_std, n_obs
+        FROM fundamental_loadings
+        GROUP BY name
+        ORDER BY name
+        """
+    )
+    loading_rows = list(cur.fetchall())
+
+    cur = db.execute(
+        """
+        SELECT COUNT(*) AS n_fc,
+               SUM(CASE WHEN p_yes_quant_only IS NOT NULL THEN 1 ELSE 0 END) AS n_qf
+        FROM forecasts
+        """
+    )
+    fc_row = cur.fetchone()
+
+    body: list[str] = []
+    body.append(
+        "<div class=sub>"
+        "The quantamental subsite augments the pure-quant universe with "
+        "<b>structured fundamental inputs</b> that shape Bayesian priors. "
+        "Each input carries a value, uncertainty, provenance, expiration, "
+        "and a quantified integration mechanism. No qualitative overlays, "
+        "no LLMs in the loop."
+        "</div>"
+    )
+
+    body.append("<h2 style='margin-top:28px'>Stock of fundamental inputs</h2>")
+    if not input_rows:
+        body.append(
+            "<div class=notice>No fundamental inputs loaded yet. Run "
+            "<code>kalshi-edge pull-fundamental</code>.</div>"
+        )
+    else:
+        body.append(
+            "<table><thead><tr>"
+            "<th>category</th><th class=num>total</th><th class=num>live</th>"
+            "</tr></thead><tbody>"
+        )
+        for r in input_rows:
+            body.append(
+                f"<tr><td>{html.escape(r['category'] or '—')}</td>"
+                f"<td class=num>{r['n']}</td>"
+                f"<td class=num>{r['n_live'] or 0}</td></tr>"
+            )
+        body.append("</tbody></table>")
+
+    body.append("<h2 style='margin-top:28px'>Calibrated loadings</h2>")
+    if not loading_rows:
+        body.append(
+            "<div class=notice>No calibrated loadings yet. Run "
+            "<code>kalshi-edge calibrate-loadings</code> (needs "
+            "<code>FRED_API_KEY</code>).</div>"
+        )
+    else:
+        body.append(
+            "<table><thead><tr>"
+            "<th>input</th><th class=num>β</th><th class=num>σ_β</th>"
+            "<th class=num>n_obs</th><th>last fit</th>"
+            "</tr></thead><tbody>"
+        )
+        for r in loading_rows:
+            body.append(
+                f"<tr><td><code>{html.escape(r['name'] or '—')}</code></td>"
+                f"<td class=num>{_fmt_float(r['beta'])}</td>"
+                f"<td class=num>{_fmt_float(r['beta_std'])}</td>"
+                f"<td class=num>{r['n_obs']}</td>"
+                f"<td>{html.escape(str(r['fit_at'] or '—'))}</td></tr>"
+            )
+        body.append("</tbody></table>")
+
+    n_fc = fc_row["n_fc"] if fc_row else 0
+    n_qf = (fc_row["n_qf"] or 0) if fc_row else 0
+    body.append(
+        f"<h2 style='margin-top:28px'>Forecast coverage</h2>"
+        f"<div class=kv><span class=k>total forecasts</span>"
+        f"<span class=v>{n_fc}</span></div>"
+        f"<div class=kv><span class=k>quantamental forecasts</span>"
+        f"<span class=v>{n_qf}</span></div>"
+    )
+
+    return _quantamental_page_shell("Overview", "".join(body), now=now)
+
+
+def write_quantamental_report(
     db: Database,
-    out_path: Path,
+    out_dir: Path,
     *,
     now: datetime | None = None,
 ) -> int:
-    """Render the universe page AND its companion subpages.
+    """Render the three quantamental pages into ``out_dir``.
 
-    ``out_path`` is the main universe HTML. ``research_queue.html`` and
-    ``calibration_split.html`` are written next to it so the in-page nav
-    links work on a GitHub Pages / local file drop. Returns the main page's
-    byte count so callers have a simple success signal.
+    Writes ``index.html`` (landing page), ``research_queue.html``, and
+    ``calibration_split.html``. Returns the bytes written for the landing
+    page (simple success signal). Briefs under ``<out_dir>/briefs/`` are
+    produced by ``build-briefs`` separately.
     """
     now = now or datetime.now(timezone.utc)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    main_html = build_report_html(db, now=now)
-    n = out_path.write_text(main_html, encoding="utf-8")
+    idx_path = out_dir / "index.html"
+    n = idx_path.write_text(build_quantamental_index_html(db, now=now), encoding="utf-8")
 
-    rq_path = out_path.parent / "research_queue.html"
+    rq_path = out_dir / "research_queue.html"
     rq_path.write_text(build_research_queue_html(db, now=now), encoding="utf-8")
 
-    cs_path = out_path.parent / "calibration_split.html"
+    cs_path = out_dir / "calibration_split.html"
     cs_path.write_text(build_calibration_split_html(db, now=now), encoding="utf-8")
 
     return n

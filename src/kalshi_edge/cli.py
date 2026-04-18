@@ -18,7 +18,7 @@ from kalshi_edge.forecasters import build_default_registry
 from kalshi_edge.logging_ import configure, get_logger
 from kalshi_edge.market import KalshiClient, UniverseFilter
 from kalshi_edge.market.parser import UnsupportedMarket, parse_market
-from kalshi_edge.report import write_report
+from kalshi_edge.report import write_report, write_quantamental_report
 from kalshi_edge.storage import Database
 from kalshi_edge.types import Category
 
@@ -27,7 +27,8 @@ from kalshi_edge.types import Category
 # consistently (e.g. GitHub Actions, ad-hoc runs, tests).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_ANALYST_INPUTS = _REPO_ROOT / "analyst_inputs"
-_DEFAULT_BRIEFS_DIR = _REPO_ROOT / "site" / "briefs"
+_DEFAULT_BRIEFS_DIR = _REPO_ROOT / "site" / "quantamental" / "briefs"
+_DEFAULT_QUANT_DIR = _REPO_ROOT / "site" / "quantamental"
 
 
 @click.group()
@@ -238,6 +239,18 @@ def build_report(cfg, out_path: Path) -> None:  # type: ignore[no-untyped-def]
     db = Database(cfg.storage.sqlite_path, wal=cfg.storage.wal_mode)
     bytes_written = write_report(db, out_path)
     click.echo(f"wrote {bytes_written} bytes to {out_path}")
+
+
+@main.command("build-quantamental")
+@click.option("--out", "out_dir", type=click.Path(path_type=Path),
+              default=_DEFAULT_QUANT_DIR,
+              help="Directory for the quantamental subsite (index.html + 2 subpages).")
+@click.pass_obj
+def build_quantamental(cfg, out_dir: Path) -> None:  # type: ignore[no-untyped-def]
+    """Render the /quantamental/ subsite: overview + research queue + calibration split."""
+    db = Database(cfg.storage.sqlite_path, wal=cfg.storage.wal_mode)
+    n = write_quantamental_report(db, out_dir)
+    click.echo(f"wrote quantamental subsite to {out_dir} (index={n} bytes)")
 
 
 @main.command("pull-fundamental")

@@ -86,13 +86,21 @@ jobs:
         run: uv run kalshi-edge forecast
 
       - name: Build research briefs
-        # Writes one Markdown brief per contract under site/briefs/ so the
-        # dashboard can link to them and GH Pages serves them as part of
-        # the deployed artifact.
-        run: uv run kalshi-edge build-briefs --out site/briefs
+        # Writes one Markdown brief per contract under site/quantamental/briefs/
+        # so the quantamental subsite can link to them and GH Pages serves
+        # them as part of the deployed artifact.
+        run: uv run kalshi-edge build-briefs --out site/quantamental/briefs
 
-      - name: Build HTML report
+      - name: Build HTML report (universe)
+        # The main universe page is pure-quant: no nav-sub, no fundamental
+        # attribution blocks. Keeps the original kalshi-edge surface intact.
         run: uv run kalshi-edge build-report --out site/index.html
+
+      - name: Build quantamental subsite
+        # Three pages under /quantamental/: overview, research queue, and
+        # calibration split. Linked *from* the nav-sub inside the subsite
+        # only; the universe page intentionally does not link down.
+        run: uv run kalshi-edge build-quantamental --out site/quantamental
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
