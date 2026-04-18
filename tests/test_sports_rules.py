@@ -65,6 +65,30 @@ def test_match_game_away_team_first() -> None:
     assert team == "Oakland Athletics"
 
 
+def test_match_game_et_date_wraps_to_next_utc_day() -> None:
+    """Regression: NBA 8pm-ET tips convert to 00:00 UTC the *next* day.
+
+    Kalshi ticker date is in America/New_York; matching on UTC date alone
+    drops every primetime NBA/NHL game on the east coast.
+    """
+    sc = parse_sports_contract("KXNBAGAME", "KXNBAGAME-26APR18TORCLE")
+    assert sc is not None
+    # 2026-04-18 20:00 America/New_York = 2026-04-19 00:00 UTC.
+    game = Game(
+        sport_key="basketball_nba",
+        game_id="g1",
+        commence_time=datetime(2026, 4, 19, 0, 0, tzinfo=timezone.utc),
+        home_team="Cleveland Cavaliers",
+        away_team="Toronto Raptors",
+        outcomes=[],
+        fetched_at=datetime.now(timezone.utc),
+    )
+    res = match_game(sc, "Will the Raptors beat the Cavaliers?", [game])
+    assert res is not None
+    _, team = res
+    assert team == "Toronto Raptors"
+
+
 def test_match_game_date_mismatch_returns_none() -> None:
     sc = parse_sports_contract("KXMLBGAME", "KXMLBGAME-26APR181605CWSATH")
     assert sc is not None

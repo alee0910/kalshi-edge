@@ -147,6 +147,67 @@ def _fmt_edge_points(model_p: float | None, mid_cents: float | None) -> tuple[st
     return f"{sign}{edge:.1f}", cls
 
 
+# Bet-recommendation gate. Below these thresholds we print "—" rather
+# than a YES/NO — the apparent edge is either too small to beat the
+# spread, too uncertain, or the market itself is too thin/pinned to
+# trade against. Tunable.
+_BET_MIN_EDGE_PTS = 5.0       # edge in probability points (¢-equivalent)
+_BET_MIN_CONF = 0.20          # model confidence floor
+_BET_MAX_SPREAD_CENTS = 15.0  # matches the universe filter
+_BET_MIN_VOL_24H = 100.0
+
+
+def _is_liquid(r: _Row) -> bool:
+    """True iff the quoted market is tradeable and its mid is informative.
+
+    We reject markets pinned to 0¢ or 100¢ on either side: a bid of 0
+    means "no one is bidding," an ask of 100 means "no one is offering",
+    and either way the ``mid`` we compute is not a fair reflection of
+    where size could actually change hands.
+    """
+    if r.yes_bid is None or r.yes_ask is None:
+        return False
+    if r.yes_bid <= 0 or r.yes_ask >= 100:
+        return False
+    if (r.yes_ask - r.yes_bid) > _BET_MAX_SPREAD_CENTS:
+        return False
+    if r.volume_24h < _BET_MIN_VOL_24H:
+        return False
+    return True
+
+
+def _bet_recommendation(r: _Row) -> tuple[str, str, str]:
+    """Return (label, css_class, reason) for the bet column.
+
+    ``label`` is 'YES', 'NO', or '—'. ``reason`` is a tooltip fragment
+    explaining why we didn't recommend (for '—' cases). The gate is the
+    conjunction of:
+      - a forecast (not abstained)
+      - |edge| ≥ _BET_MIN_EDGE_PTS
+      - confidence ≥ _BET_MIN_CONF
+      - liquid quoted market (see _is_liquid)
+    """
+    if r.fc_p_yes is None:
+        return "—", "neu", "no model forecast"
+    mid = _mid_cents(r)
+    if mid is None:
+        return "—", "neu", "no quoted mid"
+    edge = r.fc_p_yes * 100.0 - mid
+    if abs(edge) < _BET_MIN_EDGE_PTS:
+        return "—", "neu", f"edge |{edge:.1f}| < {_BET_MIN_EDGE_PTS}¢ threshold"
+    conf = r.fc_model_confidence or 0.0
+    if conf < _BET_MIN_CONF:
+        return "—", "neu", f"model confidence {conf * 100:.0f}% < {_BET_MIN_CONF * 100:.0f}%"
+    if not _is_liquid(r):
+        return "—", "neu", (
+            f"market illiquid: bid/ask {r.yes_bid}/{r.yes_ask}¢, "
+            f"vol {int(r.volume_24h)}"
+        )
+    if edge > 0:
+        return "YES", "pos", ""
+    return "NO", "neg", ""
+
+
 _CSS = """
 :root {
     --bg:#0b0d10; --fg:#e6e6e6; --muted:#9aa0a6; --accent:#7cc4ff;
@@ -179,6 +240,10 @@ tr:nth-child(even) td { background: var(--row-alt); }
 .edge.pos { color: #4ade80; font-weight: 600; }
 .edge.neg { color: #f87171; font-weight: 600; }
 .edge.neu { color: var(--muted); }
+.bet { text-align: center; font-weight: 700; letter-spacing: 0.04em; font-size: 12px; }
+.bet.pos { color: #0b0d10; background: #4ade80; }
+.bet.neg { color: #fff; background: #dc2626; }
+.bet.neu { color: var(--muted); font-weight: 400; }
 .ci { color: var(--muted); font-size: 11px; }
 .null { color: var(--muted); font-style: italic; font-size: 12px; }
 .notice {
@@ -287,10 +352,13 @@ def build_report_html(db: Database, *, now: datetime | None = None) -> str:
     parts.append("</div>")
 
     parts.append("<div class=notice>")
-    parts.append("<b>model p_yes</b> is this system's Bayesian posterior for YES; ")
-    parts.append("<b>edge</b> is model − market (in points). Positive = model thinks YES is underpriced (buy YES). ")
-    parts.append("Negative = overpriced (buy NO). A <b>[p05, p95]</b> band on model p_yes shows posterior uncertainty. ")
-    parts.append("Markets without an edge (forecaster abstained / not built) show below the actionable rows.")
+    parts.append("<b>Market ¢</b> is the current YES mid-price in cents (0 = certain NO, 100 = certain YES). ")
+    parts.append("<b>Fair ¢</b> is our model's estimate of the same thing — what the YES contract is <i>really</i> worth. ")
+    parts.append("<b>Edge</b> is Fair − Market in cents. <b>Bet</b> says YES / NO / — based on the edge, our confidence, ")
+    parts.append(f"and whether the market is liquid enough to trade (we suppress recommendations when |edge| &lt; {_BET_MIN_EDGE_PTS:.0f}¢, ")
+    parts.append(f"confidence &lt; {_BET_MIN_CONF*100:.0f}%, spread &gt; {_BET_MAX_SPREAD_CENTS:.0f}¢, ")
+    parts.append(f"vol &lt; {_BET_MIN_VOL_24H:.0f}, or either side is pinned to 0¢/100¢). ")
+    parts.append("Rows the forecaster couldn't run on sink to the bottom.")
     parts.append("</div>")
 
     parts.append("<div class=tiles>")
@@ -315,11 +383,13 @@ def build_report_html(db: Database, *, now: datetime | None = None) -> str:
     parts.append("<table><thead><tr>")
     parts.append("<th>ticker</th><th>title</th>")
     parts.append("<th class=num>DTE</th>")
-    parts.append("<th class=num>mid</th><th class=num>spread</th>")
-    parts.append("<th class=num>vol 24h</th>")
-    parts.append("<th class=num>model p</th>")
-    parts.append("<th class=num>edge (pts)</th>")
-    parts.append("<th class=num>conf</th>")
+    parts.append("<th class=num>Market ¢</th>")
+    parts.append("<th class=num>Fair ¢</th>")
+    parts.append("<th class=num>Edge</th>")
+    parts.append("<th>Bet</th>")
+    parts.append("<th class=num>Conf</th>")
+    parts.append("<th class=num>Spread</th>")
+    parts.append("<th class=num>Vol 24h</th>")
     parts.append("</tr></thead><tbody>")
 
     for r in sorted_rows:
@@ -339,21 +409,35 @@ def build_report_html(db: Database, *, now: datetime | None = None) -> str:
         parts.append(f"<td class=title title='{html.escape(r.title)}'>{html.escape(r.title)}</td>")
         parts.append(f"<td class=num>{_fmt_dte(dte)}</td>")
         parts.append(f"<td class=num>{_fmt_cents(mid)}</td>")
-        parts.append(f"<td class=num>{_fmt_cents(spread)}</td>")
-        parts.append(f"<td class=num>{_fmt_int(r.volume_24h)}</td>")
         if r.fc_p_yes is not None:
+            fair_cents = r.fc_p_yes * 100.0
             ci = ""
             if r.fc_p05 is not None and r.fc_p95 is not None:
-                ci = f"<div class=ci>[{_fmt_prob(r.fc_p05)}, {_fmt_prob(r.fc_p95)}]</div>"
-            parts.append(f"<td class=num>{_fmt_prob(r.fc_p_yes)}{ci}</td>")
+                ci = (
+                    f"<div class=ci>"
+                    f"[{r.fc_p05 * 100:.0f}¢, {r.fc_p95 * 100:.0f}¢]"
+                    f"</div>"
+                )
+            parts.append(f"<td class=num>{fair_cents:.1f}¢{ci}</td>")
             edge_txt, edge_cls = _fmt_edge_points(r.fc_p_yes, mid)
             parts.append(f"<td class='num edge {edge_cls}'>{edge_txt}</td>")
+            bet_label, bet_cls, bet_reason = _bet_recommendation(r)
+            bet_attr = f" title='{html.escape(bet_reason)}'" if bet_reason else ""
+            parts.append(
+                f"<td class='bet {bet_cls}'{bet_attr}>{bet_label}</td>"
+            )
             parts.append(f"<td class=num>{_fmt_prob(r.fc_model_confidence)}</td>")
         elif r.fc_null_reason:
-            parts.append("<td class=num colspan=3><span class=null>"
-                         f"abstained — {html.escape(r.fc_null_reason[:80])}</span></td>")
+            parts.append(
+                "<td class=num colspan=4><span class=null>"
+                f"abstained — {html.escape(r.fc_null_reason[:100])}</span></td>"
+            )
         else:
-            parts.append("<td class=num colspan=3><span class=null>no forecaster</span></td>")
+            parts.append(
+                "<td class=num colspan=4><span class=null>no forecaster</span></td>"
+            )
+        parts.append(f"<td class=num>{_fmt_cents(spread)}</td>")
+        parts.append(f"<td class=num>{_fmt_int(r.volume_24h)}</td>")
         parts.append("</tr>")
     parts.append("</tbody></table>")
 

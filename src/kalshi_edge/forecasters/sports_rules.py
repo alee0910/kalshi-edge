@@ -16,9 +16,17 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 from kalshi_edge.data_sources.the_odds_api import Game, SERIES_TO_SPORT
+
+# Kalshi encodes event dates in US/Eastern (the league schedule's local
+# calendar day), while the-odds-api returns commence_time in UTC. A
+# 20:00 ET tip converts to 00:00 UTC the *next* calendar day, so a naive
+# UTC-date comparison drops most primetime NBA/NHL games. We normalize
+# by comparing the game's ET-local date to the ticker's encoded date.
+_KALSHI_TZ = ZoneInfo("America/New_York")
 
 _DATE_RE = re.compile(r"-(\d{2})([A-Z]{3})(\d{2})")
 _MONTHS = {m: i for i, m in enumerate(
@@ -86,7 +94,10 @@ def match_game(
     title_l = (title or "").lower()
     candidates: list[tuple[Game, str, int]] = []  # game, team, earliest-hit position
     for g in games:
-        if g.commence_time.date() != sc.target_date:
+        ct = g.commence_time
+        if ct.tzinfo is None:
+            ct = ct.replace(tzinfo=timezone.utc)
+        if ct.astimezone(_KALSHI_TZ).date() != sc.target_date:
             continue
         home_pos = _first_hit(title_l, _team_tokens(g.home_team))
         away_pos = _first_hit(title_l, _team_tokens(g.away_team))
