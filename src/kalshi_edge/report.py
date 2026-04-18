@@ -229,6 +229,14 @@ def _bet_recommendation(r: _Row) -> tuple[str, str, str]:
             f"market illiquid: bid/ask {r.yes_bid}/{r.yes_ask}¢, "
             f"vol {int(r.volume_24h)}"
         )
+    # Sanity gate: refuse to recommend on extreme disagreements against a
+    # liquid market until a human has eyeballed the audit panel. Such edges
+    # are more often a sign-flip bug than a real mispricing.
+    if abs(edge) >= 40.0:
+        return "—", "neu", (
+            f"model disagrees with liquid market by {edge:+.0f}¢ — "
+            f"review the audit panel before trading"
+        )
     if edge > 0:
         return "YES", "pos", ""
     return "NO", "neg", ""
@@ -259,6 +267,10 @@ h2 .count { color: var(--muted); font-weight: 400; font-size: 12px; margin-left:
 table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
 th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); }
 th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--fg); }
+th.sortable .arr { color: var(--border); margin-left: 4px; font-size: 9px; display: inline-block; width: 8px; }
+th.sortable.sorted .arr { color: var(--accent); }
 td.num, th.num { text-align: right; }
 tr:nth-child(even) td { background: var(--row-alt); }
 .ticker { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--accent); }
@@ -300,6 +312,12 @@ tr:nth-child(even) td { background: var(--row-alt); }
     font-weight: 600;
 }
 .detail-empty { color: var(--muted); font-style: italic; font-size: 12px; }
+.detail-warn {
+    background: #2a1510; border: 1px solid #7a2010; border-left: 3px solid #f59e0b;
+    color: #fbbf24; padding: 8px 12px; margin: 10px 0 4px;
+    border-radius: 4px; font-size: 12px; line-height: 1.5;
+}
+.detail-warn b { color: #fde68a; }
 .kv {
     display: grid;
     grid-template-columns: 220px 1fr;
@@ -345,14 +363,15 @@ a:hover { text-decoration: underline; }
 _INLINE_JS = """
 (function(){
   var pills = document.querySelectorAll('.pill');
-  var rows = document.querySelectorAll('tbody tr[data-cat]');
   var activeCat = 'all';
-  function apply(cat){
+  function mainRows(){ return document.querySelectorAll('tbody tr.main-row'); }
+  function allRows(){ return document.querySelectorAll('tbody tr[data-cat]'); }
+  function applyFilter(cat){
     activeCat = cat;
+    var rows = allRows();
     for (var i=0;i<rows.length;i++){
       var r = rows[i];
       var catMatch = (cat === 'all' || r.getAttribute('data-cat') === cat);
-      // Detail rows inherit visibility from category and from their expanded state.
       if (r.classList.contains('detail-row')) {
         r.style.display = (catMatch && !r.hasAttribute('hidden')) ? '' : 'none';
       } else {
@@ -364,7 +383,7 @@ _INLINE_JS = """
     }
   }
   for (var k=0;k<pills.length;k++){
-    pills[k].addEventListener('click', function(e){ apply(e.currentTarget.getAttribute('data-cat')); });
+    pills[k].addEventListener('click', function(e){ applyFilter(e.currentTarget.getAttribute('data-cat')); });
   }
   // Toggle edge-detail rows on click.
   var edges = document.querySelectorAll('.edge-click');
@@ -381,10 +400,68 @@ _INLINE_JS = """
         d.setAttribute('hidden', '');
         e.currentTarget.classList.remove('open');
       }
-      // Reapply the category filter so the toggle respects it.
       var catMatch = (activeCat === 'all' || d.getAttribute('data-cat') === activeCat);
       d.style.display = (catMatch && !d.hasAttribute('hidden')) ? '' : 'none';
     });
+  }
+
+  // Column sort. Clicking a sortable <th> sorts main rows by that column.
+  // Missing values (abstained / no forecaster) always sink to the bottom.
+  // The detail row is re-attached immediately after its parent so the
+  // audit panel stays paired with its main row.
+  var heads = document.querySelectorAll('th.sortable');
+  var sortState = { key: null, dir: 'desc' };
+  function readVal(row, key, type){
+    var cell = row.querySelector("td[data-key='" + key + "']");
+    if (!cell) return null;
+    var raw = cell.getAttribute('data-s');
+    if (raw === null || raw === '' || raw === 'NaN') return null;
+    if (type === 'num') {
+      var n = parseFloat(raw);
+      return isNaN(n) ? null : n;
+    }
+    return raw.toLowerCase();
+  }
+  function sortBy(key, type){
+    var dir = (sortState.key === key && sortState.dir === 'desc') ? 'asc' : 'desc';
+    sortState = { key: key, dir: dir };
+    var tbody = document.querySelector('tbody');
+    var rows = Array.prototype.slice.call(mainRows());
+    rows.sort(function(a, b){
+      var va = readVal(a, key, type);
+      var vb = readVal(b, key, type);
+      var aNull = (va === null), bNull = (vb === null);
+      if (aNull && bNull) return 0;
+      if (aNull) return 1;  // nulls sink to bottom always
+      if (bNull) return -1;
+      if (va < vb) return dir === 'asc' ? -1 : 1;
+      if (va > vb) return dir === 'asc' ? 1 : -1;
+      return 0;
+    });
+    for (var i=0;i<rows.length;i++){
+      var r = rows[i];
+      tbody.appendChild(r);
+      var detailId = r.getAttribute('data-detail-id');
+      if (detailId) {
+        var d = document.getElementById(detailId);
+        if (d) tbody.appendChild(d);
+      }
+    }
+    for (var j=0;j<heads.length;j++){
+      var h = heads[j];
+      var isActive = (h.getAttribute('data-key') === key);
+      h.classList.toggle('sorted', isActive);
+      var arr = h.querySelector('.arr');
+      if (arr) arr.textContent = isActive ? (dir === 'asc' ? '\u25B2' : '\u25BC') : '';
+    }
+    applyFilter(activeCat);  // re-apply visibility
+  }
+  for (var m=0;m<heads.length;m++){
+    (function(h){
+      h.addEventListener('click', function(){
+        sortBy(h.getAttribute('data-key'), h.getAttribute('data-type') || 'alpha');
+      });
+    })(heads[m]);
   }
 })();
 """
@@ -435,6 +512,42 @@ def _kv_block(d: dict[str, Any]) -> str:
             f"</div>"
         )
     return "".join(rows)
+
+
+def _sanity_warnings(r: _Row, mid: float | None, edge_pts: float | None) -> list[str]:
+    """Heuristic sanity flags for extreme model-vs-market disagreement.
+
+    These aren't errors — the model *can* beat a mispriced market — but
+    large disagreements with a liquid market are the smoke signal for
+    parser bugs (wrong comparator direction, wrong transform, etc.). We
+    surface them in the detail panel so the user can eyeball before
+    trusting the number. Tuned to fire rarely: both the edge and the
+    market must be extreme.
+    """
+    out: list[str] = []
+    if r.fc_p_yes is None or mid is None or edge_pts is None:
+        return out
+    fair_pts = r.fc_p_yes * 100.0
+    # A: model near-certain (>97% or <3%) but market strongly disagrees
+    # AND the market is liquid enough to take seriously.
+    if _is_liquid(r) and abs(edge_pts) >= 40.0:
+        out.append(
+            f"Model ({fair_pts:.1f}¢) disagrees with a liquid market ({mid:.1f}¢) "
+            f"by {edge_pts:+.1f}¢. In practice this is almost always a parser "
+            f"sign-flip or unit-mismatch bug — verify the contract's YES "
+            f"direction and the model's underlying transform in the "
+            f"Diagnostics section below before trusting this edge."
+        )
+    # B: market pinned at an extreme (<3¢ or >97¢) but the model is moderate.
+    # This can be real (thin liquidity at tails) but is worth a look.
+    if mid is not None and (mid <= 3.0 or mid >= 97.0) and 10.0 <= fair_pts <= 90.0:
+        out.append(
+            f"Market is pinned near {'0¢' if mid <= 3 else '100¢'} but our "
+            f"model gives {fair_pts:.1f}¢. If the market has meaningful "
+            f"depth this is suspicious — check whether the model's "
+            f"threshold/transform matches the contract subtitle."
+        )
+    return out
 
 
 def _build_detail_html(r: _Row, mid: float | None) -> str:
@@ -495,9 +608,15 @@ def _build_detail_html(r: _Row, mid: float | None) -> str:
         f"</div>"
     )
 
+    warn_blocks = [
+        f"<div class=detail-warn><b>Heads up:</b> {html.escape(w)}</div>"
+        for w in _sanity_warnings(r, mid, edge_pts)
+    ]
+
     return (
         "<div class=detail-card>"
         + meta
+        + "".join(warn_blocks)
         + "<div class=detail-section><div class=detail-h>Pricing breakdown</div>"
         + "".join(pricing_lines)
         + "</div>"
@@ -560,7 +679,7 @@ def build_report_html(db: Database, *, now: datetime | None = None) -> str:
     parts.append(f"confidence &lt; {_BET_MIN_CONF*100:.0f}%, spread &gt; {_BET_MAX_SPREAD_CENTS:.0f}¢, ")
     parts.append(f"vol &lt; {_BET_MIN_VOL_24H:.0f}, or either side is pinned to 0¢/100¢). ")
     parts.append("Click any <b>Edge</b> value to audit how that edge was derived — model, data inputs, and raw diagnostics. ")
-    parts.append("Rows the forecaster couldn't run on sink to the bottom.")
+    parts.append("Click any column header to re-sort; rows the forecaster couldn't run on always sink to the bottom.")
     parts.append("</div>")
 
     parts.append("<div class=tiles>")
@@ -583,15 +702,46 @@ def build_report_html(db: Database, *, now: datetime | None = None) -> str:
     parts.append("</div>")
 
     parts.append("<table><thead><tr>")
-    parts.append("<th>ticker</th><th>title</th>")
-    parts.append("<th class=num>DTE</th>")
-    parts.append("<th class=num>Market ¢</th>")
-    parts.append("<th class=num>Fair ¢</th>")
-    parts.append("<th class=num>Edge</th>")
-    parts.append("<th>Bet</th>")
-    parts.append("<th class=num>Conf</th>")
-    parts.append("<th class=num>Spread</th>")
-    parts.append("<th class=num>Vol 24h</th>")
+    parts.append(
+        "<th class='sortable' data-key='ticker' data-type='alpha'>"
+        "ticker<span class=arr></span></th>"
+    )
+    parts.append(
+        "<th class='sortable' data-key='title' data-type='alpha'>"
+        "title<span class=arr></span></th>"
+    )
+    parts.append(
+        "<th class='num sortable' data-key='dte' data-type='num'>"
+        "DTE<span class=arr></span></th>"
+    )
+    parts.append(
+        "<th class='num sortable' data-key='market' data-type='num'>"
+        "Market &cent;<span class=arr></span></th>"
+    )
+    parts.append(
+        "<th class='num sortable' data-key='fair' data-type='num'>"
+        "Fair &cent;<span class=arr></span></th>"
+    )
+    parts.append(
+        "<th class='num sortable sorted' data-key='edge' data-type='num'>"
+        "Edge<span class='arr'>\u25BC</span></th>"
+    )
+    parts.append(
+        "<th class='sortable' data-key='bet' data-type='alpha'>"
+        "Bet<span class=arr></span></th>"
+    )
+    parts.append(
+        "<th class='num sortable' data-key='conf' data-type='num'>"
+        "Conf<span class=arr></span></th>"
+    )
+    parts.append(
+        "<th class='num sortable' data-key='spread' data-type='num'>"
+        "Spread<span class=arr></span></th>"
+    )
+    parts.append(
+        "<th class='num sortable' data-key='vol' data-type='num'>"
+        "Vol 24h<span class=arr></span></th>"
+    )
     parts.append("</tr></thead><tbody>")
 
     for idx, r in enumerate(sorted_rows):
@@ -602,9 +752,13 @@ def build_report_html(db: Database, *, now: datetime | None = None) -> str:
             spread = r.yes_ask - r.yes_bid
         cat_attr = html.escape(r.category)
         row_id = f"row-{idx}"
-        parts.append(f"<tr data-cat='{cat_attr}' id='{row_id}'>")
+        has_forecast = r.fc_p_yes is not None
+        detail_attr = f" data-detail-id='detail-{idx}'" if has_forecast else ""
         parts.append(
-            f"<td class=ticker>"
+            f"<tr class='main-row' data-cat='{cat_attr}' id='{row_id}'{detail_attr}>"
+        )
+        parts.append(
+            f"<td class=ticker data-key='ticker' data-s='{html.escape(r.ticker)}'>"
             f"<a href='{html.escape(_kalshi_url(r))}' target=_blank rel=noopener>"
             f"{html.escape(r.ticker)}</a>"
             f"<span class=cat-tag>{cat_attr}</span></td>"
@@ -617,11 +771,18 @@ def build_report_html(db: Database, *, now: datetime | None = None) -> str:
             )
             tooltip = f"{r.title} (YES resolves on: {r.subtitle})"
         parts.append(
-            f"<td class=title title='{html.escape(tooltip)}'>{title_html}</td>"
+            f"<td class=title data-key='title' data-s='{html.escape(r.title)}' "
+            f"title='{html.escape(tooltip)}'>{title_html}</td>"
         )
-        parts.append(f"<td class=num>{_fmt_dte(dte)}</td>")
-        parts.append(f"<td class=num>{_fmt_cents(mid)}</td>")
-        if r.fc_p_yes is not None:
+        dte_s = f"{dte:.6f}" if dte is not None else ""
+        parts.append(
+            f"<td class=num data-key='dte' data-s='{dte_s}'>{_fmt_dte(dte)}</td>"
+        )
+        mid_s = f"{mid:.4f}" if mid is not None else ""
+        parts.append(
+            f"<td class=num data-key='market' data-s='{mid_s}'>{_fmt_cents(mid)}</td>"
+        )
+        if has_forecast:
             fair_cents = r.fc_p_yes * 100.0
             ci = ""
             if r.fc_p05 is not None and r.fc_p95 is not None:
@@ -630,33 +791,59 @@ def build_report_html(db: Database, *, now: datetime | None = None) -> str:
                     f"[{r.fc_p05 * 100:.0f}¢, {r.fc_p95 * 100:.0f}¢]"
                     f"</div>"
                 )
-            parts.append(f"<td class=num>{fair_cents:.1f}¢{ci}</td>")
+            parts.append(
+                f"<td class=num data-key='fair' data-s='{fair_cents:.4f}'>"
+                f"{fair_cents:.1f}¢{ci}</td>"
+            )
+            edge_pts = _edge_points(r)
             edge_txt, edge_cls = _fmt_edge_points(r.fc_p_yes, mid)
+            edge_s = f"{edge_pts:.4f}" if edge_pts is not None else ""
             parts.append(
                 f"<td class='num edge {edge_cls} edge-click' "
+                f"data-key='edge' data-s='{edge_s}' "
                 f"data-detail='detail-{idx}' "
                 f"title='Click to see how this edge was derived'>"
                 f"{edge_txt} <span class=edge-caret>▸</span></td>"
             )
             bet_label, bet_cls, bet_reason = _bet_recommendation(r)
+            # Sort key: YES first, NO last, — in the middle.
+            bet_sort = {"YES": "a-yes", "—": "b-none", "NO": "c-no"}.get(bet_label, "z")
             bet_attr = f" title='{html.escape(bet_reason)}'" if bet_reason else ""
             parts.append(
-                f"<td class='bet {bet_cls}'{bet_attr}>{bet_label}</td>"
+                f"<td class='bet {bet_cls}' data-key='bet' "
+                f"data-s='{bet_sort}'{bet_attr}>{bet_label}</td>"
             )
-            parts.append(f"<td class=num>{_fmt_prob(r.fc_model_confidence)}</td>")
-        elif r.fc_null_reason:
+            conf_s = (
+                f"{r.fc_model_confidence:.4f}"
+                if r.fc_model_confidence is not None else ""
+            )
             parts.append(
-                "<td class=num colspan=4><span class=null>"
-                f"abstained — {html.escape(r.fc_null_reason[:100])}</span></td>"
+                f"<td class=num data-key='conf' data-s='{conf_s}'>"
+                f"{_fmt_prob(r.fc_model_confidence)}</td>"
+            )
+        elif r.fc_null_reason:
+            # colspan cell covers fair/edge/bet/conf — no sortable values.
+            parts.append(
+                "<td class=num colspan=4 data-key='fair' data-s=''>"
+                f"<span class=null>abstained — "
+                f"{html.escape(r.fc_null_reason[:100])}</span></td>"
             )
         else:
             parts.append(
-                "<td class=num colspan=4><span class=null>no forecaster</span></td>"
+                "<td class=num colspan=4 data-key='fair' data-s=''>"
+                "<span class=null>no forecaster</span></td>"
             )
-        parts.append(f"<td class=num>{_fmt_cents(spread)}</td>")
-        parts.append(f"<td class=num>{_fmt_int(r.volume_24h)}</td>")
+        spread_s = f"{spread:.4f}" if spread is not None else ""
+        parts.append(
+            f"<td class=num data-key='spread' data-s='{spread_s}'>"
+            f"{_fmt_cents(spread)}</td>"
+        )
+        parts.append(
+            f"<td class=num data-key='vol' data-s='{r.volume_24h:.4f}'>"
+            f"{_fmt_int(r.volume_24h)}</td>"
+        )
         parts.append("</tr>")
-        if r.fc_p_yes is not None:
+        if has_forecast:
             detail_inner = _build_detail_html(r, mid)
             parts.append(
                 f"<tr class='detail-row' id='detail-{idx}' data-cat='{cat_attr}' hidden>"

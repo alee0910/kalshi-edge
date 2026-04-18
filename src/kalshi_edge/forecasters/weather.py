@@ -99,18 +99,17 @@ class WeatherForecaster(Forecaster):
     def supports(self, contract: Contract) -> bool:
         if contract.category != Category.WEATHER:
             return False
-        return parse_weather_contract(
-            contract.series_ticker, contract.event_ticker, contract.ticker
-        ) is not None
+        return parse_weather_contract(contract) is not None
 
     def _forecast_impl(
         self, contract: Contract, snapshot: MarketSnapshot | None,
     ) -> ForecastResult:
-        wc = parse_weather_contract(
-            contract.series_ticker, contract.event_ticker, contract.ticker
-        )
+        wc = parse_weather_contract(contract)
         if wc is None:
-            return self._null(contract, "weather_contract_unparseable")
+            return self._null(
+                contract,
+                "weather_contract_unparseable (unknown location, date, or strike_type)",
+            )
 
         # Days-ahead used to decide request window + sanity-check lead time.
         today = datetime.now(timezone.utc).date()
@@ -140,7 +139,9 @@ class WeatherForecaster(Forecaster):
             "ensemble_mean_f": float(np.mean(members)),
             "ensemble_std_f": float(np.std(members, ddof=1)),
             "variance_inflation": self.kappa,
-            "threshold_f": wc.threshold_f,
+            "yes_direction": wc.criterion.direction,
+            "yes_low_f": wc.criterion.low,
+            "yes_high_f": wc.criterion.high,
             "target_date": wc.target_date.isoformat(),
             "days_ahead": days_ahead,
         }
@@ -197,12 +198,25 @@ class WeatherForecaster(Forecaster):
         # Inflate per bootstrap draw and clamp.
         bsd = np.maximum(bsd * self.kappa, MIN_POSTERIOR_STD_F)
 
-        # P(T > threshold) via the Gaussian CDF. vectorized.
+        # P(YES) via the Gaussian CDF, per bootstrap draw. The YES direction
+        # comes from Kalshi's strike_type field, not from any ticker-suffix
+        # convention — see weather_rules.parse_weather_contract.
         from scipy.stats import norm
-        z = (wc.threshold_f - bmu) / bsd
-        p_yes_samples = 1.0 - norm.cdf(z)
-        if wc.comparator == "below":
-            p_yes_samples = 1.0 - p_yes_samples
+        crit = wc.criterion
+        if crit.direction == "above":
+            assert crit.low is not None
+            z = (crit.low - bmu) / bsd
+            p_yes_samples = 1.0 - norm.cdf(z)
+        elif crit.direction == "below":
+            assert crit.high is not None
+            z = (crit.high - bmu) / bsd
+            p_yes_samples = norm.cdf(z)
+        else:
+            assert crit.direction == "between"
+            assert crit.low is not None and crit.high is not None
+            z_hi = (crit.high - bmu) / bsd
+            z_lo = (crit.low - bmu) / bsd
+            p_yes_samples = norm.cdf(z_hi) - norm.cdf(z_lo)
 
         # Numerical guard. Even with clamping, float underflow near the tails
         # can pin samples to exact 0/1, which the entropy decomposition then

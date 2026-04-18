@@ -1,29 +1,27 @@
-"""Economics forecaster — CPI YoY in a release month.
+"""Economics forecaster — CPI release month (MoM and YoY variants).
 
 DGP: the Consumer Price Index (CPIAUCSL on FRED). We model monthly
 log-CPI as ARIMA(1,1,0) with drift — a standard workhorse for CPI
-short-horizon nowcasts. The YoY contract resolves on
+short-horizon nowcasts. Gaussian-residuals on the log-differences;
+σ is fit from observed residuals. We simulate N trajectories forward
+from the latest observation to the target release month, then compute
+P(YES) empirically from the draws.
 
-    YoY_t = CPI_t / CPI_{t-12} - 1
+Two Kalshi series, different underlying transforms — we used to conflate
+them and got a ~100% P(YES) on KXCPI markets that should have been
+priced at ~5% because we were asking "YoY > 1%" (nearly certain given
+~2-3% trend inflation) when the market actually asks "month-over-month
+CPI change > 1%" (very rare; MoM typically 0.1-0.4%).
 
-Given we observe CPI up through some past month and the contract
-resolves for a future month t*, we simulate forward the remaining
-log-differences from the fitted model and carry through to YoY at t*.
+    KXCPI      → "CPI increases by more than X% in {month}" → **MoM**
+    KXCPIYOY   → "rate of CPI inflation above X% for year ending {month}" → **YoY**
 
-A Gaussian-residuals assumption on the log-differences is used; the
-residuals from the fit give us σ. We then draw N trajectories, compute
-YoY_{t*} per trajectory, and compute P(YoY_{t*} > threshold) as the
-empirical tail probability. This gives us an underlying posterior over
-YoY (the DGP) and a bootstrap-style binary posterior.
+The YES direction comes from Kalshi's structured ``strike_type`` field
+(via market.strikes.parse_yes_criterion), not from a hardcoded
+comparator. If the field is missing or a shape we don't handle, abstain.
 
-If FRED isn't configured, or the ticker isn't a YoY market we can
-unambiguously parse, we abstain with a reason. No synthetic data, no
-fake precision.
-
-Supported ticker grammar:
-    series KXCPIYOY / KXCPI
-    event  KXCPIYOY-<YY><MON>          e.g. 26JUN
-    ticker KXCPIYOY-<YY><MON>-T<float> threshold in percent (strict >)
+If FRED isn't configured, or the ticker isn't parseable, we abstain
+with a reason. No synthetic data, no fake precision.
 """
 
 from __future__ import annotations
@@ -38,6 +36,7 @@ import numpy as np
 from kalshi_edge.data_sources.fred import FredClient, FredSeries
 from kalshi_edge.forecast import ForecastDistribution, ForecastResult
 from kalshi_edge.forecasters.base import Forecaster
+from kalshi_edge.market.strikes import YesCriterion, parse_yes_criterion
 from kalshi_edge.types import Category, Contract, MarketSnapshot
 
 
@@ -45,21 +44,24 @@ _MONTHS = {m: i + 1 for i, m in enumerate(
     ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"])}
 
 _EVENT_MONTH_RE = re.compile(r"-(\d{2})([A-Z]{3})(?:-|$)")
-_THRESHOLD_RE = re.compile(r"-T(-?\d+(?:\.\d+)?)$")
 
 
 @dataclass(frozen=True, slots=True)
 class CPIContract:
-    target_month: date   # first-of-month in the release month
-    threshold_pct: float
+    target_month: date      # first-of-month in the release month
+    transform: str          # "mom" (month-over-month) or "yoy" (year-over-year)
+    criterion: YesCriterion # direction + bounds from Kalshi's strike_type
 
 
-def parse_cpi_contract(series_ticker: str, event_ticker: str,
-                       ticker: str) -> CPIContract | None:
-    ser = series_ticker.upper().strip()
-    if ser not in ("KXCPIYOY", "KXCPI"):
+def parse_cpi_contract(contract: Contract) -> CPIContract | None:
+    ser = contract.series_ticker.upper().strip()
+    if ser == "KXCPIYOY":
+        transform = "yoy"
+    elif ser == "KXCPI":
+        transform = "mom"
+    else:
         return None
-    mm = _EVENT_MONTH_RE.search(event_ticker.upper())
+    mm = _EVENT_MONTH_RE.search(contract.event_ticker.upper())
     if not mm:
         return None
     yy = int(mm.group(1))
@@ -68,10 +70,10 @@ def parse_cpi_contract(series_ticker: str, event_ticker: str,
         return None
     target = date(2000 + yy, mon, 1)
 
-    mt = _THRESHOLD_RE.search(ticker.upper())
-    if not mt:
+    criterion = parse_yes_criterion(contract.raw or {})
+    if criterion is None:
         return None
-    return CPIContract(target_month=target, threshold_pct=float(mt.group(1)))
+    return CPIContract(target_month=target, transform=transform, criterion=criterion)
 
 
 class EconomicsCPIForecaster(Forecaster):
@@ -95,9 +97,7 @@ class EconomicsCPIForecaster(Forecaster):
     def supports(self, contract: Contract) -> bool:
         if contract.category != Category.ECONOMICS:
             return False
-        return parse_cpi_contract(
-            contract.series_ticker, contract.event_ticker, contract.ticker,
-        ) is not None
+        return parse_cpi_contract(contract) is not None
 
     def _ensure_client(self) -> FredClient | None:
         if self._client is not None:
@@ -111,11 +111,12 @@ class EconomicsCPIForecaster(Forecaster):
     def _forecast_impl(
         self, contract: Contract, snapshot: MarketSnapshot | None,
     ) -> ForecastResult:
-        cpi_contract = parse_cpi_contract(
-            contract.series_ticker, contract.event_ticker, contract.ticker,
-        )
+        cpi_contract = parse_cpi_contract(contract)
         if cpi_contract is None:
-            return self._null(contract, "cpi_contract_unparseable")
+            return self._null(
+                contract,
+                "cpi_contract_unparseable (unknown series, month, or strike_type)",
+            )
 
         client = self._ensure_client()
         if client is None:
@@ -144,12 +145,14 @@ class EconomicsCPIForecaster(Forecaster):
         if steps > 18:
             return self._null(contract, f"target_month_beyond_horizon: {steps}m")
 
-        p_yes_samples, yoy_samples, fit = self._simulate(
-            values=values, steps=steps, threshold_pct=cpi_contract.threshold_pct,
+        p_yes_samples, underlying_samples, fit = self._simulate(
+            values=values, steps=steps,
+            transform=cpi_contract.transform,
+            criterion=cpi_contract.criterion,
         )
 
         binary = ForecastDistribution(kind="samples", samples=p_yes_samples)
-        underlying = ForecastDistribution(kind="samples", samples=yoy_samples)
+        underlying = ForecastDistribution(kind="samples", samples=underlying_samples)
 
         return ForecastResult(
             ticker=contract.ticker,
@@ -165,6 +168,7 @@ class EconomicsCPIForecaster(Forecaster):
                 "horizon_months": steps,
                 "simulations": self.n_sims,
                 "posterior_over_p": "Monte Carlo over simulated trajectories",
+                "transform": cpi_contract.transform,
                 "latest_obs": latest_obs_date.isoformat(),
                 "fit": fit,
             },
@@ -172,15 +176,26 @@ class EconomicsCPIForecaster(Forecaster):
             diagnostics={
                 "p_yes_mean": float(np.mean(p_yes_samples)),
                 "p_yes_std": float(np.std(p_yes_samples, ddof=1)),
-                "yoy_mean": float(np.mean(yoy_samples)),
-                "yoy_std": float(np.std(yoy_samples, ddof=1)),
-                "threshold_pct": cpi_contract.threshold_pct,
+                "underlying_mean_pct": float(np.mean(underlying_samples)),
+                "underlying_std_pct": float(np.std(underlying_samples, ddof=1)),
+                "yes_direction": cpi_contract.criterion.direction,
+                "yes_low_pct": cpi_contract.criterion.low,
+                "yes_high_pct": cpi_contract.criterion.high,
+                "transform": cpi_contract.transform,
             },
         )
 
     def _simulate(self, *, values: np.ndarray, steps: int,
-                  threshold_pct: float) -> tuple[np.ndarray, np.ndarray, dict]:
-        """ARIMA(1,1,0)-with-drift simulation on log-CPI. Returns (p_yes, yoy, fit)."""
+                  transform: str,
+                  criterion: YesCriterion,
+                  ) -> tuple[np.ndarray, np.ndarray, dict]:
+        """ARIMA(1,1,0)-with-drift simulation on log-CPI.
+
+        Returns (p_yes_per_boot, underlying_pct, fit) where
+        ``underlying_pct`` is whichever transform the contract asks about
+        (MoM% or YoY%). The binary posterior is a Bayesian bootstrap of
+        the empirical tail probability under the criterion's direction.
+        """
         log_cpi = np.log(values)
         diff = np.diff(log_cpi)                      # monthly log-returns
         # OLS AR(1) with intercept on diff.
@@ -192,58 +207,67 @@ class EconomicsCPIForecaster(Forecaster):
         residuals = y - (mu + phi * x)
         sigma = float(np.std(residuals, ddof=2))
 
-        # For YoY at step t*, we need CPI_{t*} / CPI_{t*-12}. Both may be
-        # in the simulated future depending on how far ahead we are.
         rng = self.rng
         N = self.n_sims
 
         last = float(log_cpi[-1])
         last_diff = float(diff[-1])
-        # Buffer of 13 to cover YoY ratio even when steps < 12.
-        horizon = steps + 13
-        # Pre-seed the first 12 months' log-CPI from observed (for YoY denom).
+        # Pre-seed the last 12 observed log-CPI values (for YoY denominator
+        # when the 12-months-prior point pre-dates the simulation window).
         hist_tail = log_cpi[-12:].copy() if log_cpi.size >= 12 else np.full(12, last)
-        # Simulate
+
         shocks = rng.normal(0.0, sigma, size=(N, steps))
         traj = np.empty((N, steps), dtype=float)
         prev_diff = np.full(N, last_diff)
         prev_log = np.full(N, last)
+        diffs_out = np.empty((N, steps), dtype=float)
         for t in range(steps):
             new_diff = mu + phi * prev_diff + shocks[:, t]
             prev_log = prev_log + new_diff
             traj[:, t] = prev_log
+            diffs_out[:, t] = new_diff
             prev_diff = new_diff
 
-        # Target = YoY at step steps-1 of the simulation:
-        # CPI_target / CPI_{target-12months}, compare and convert to pct.
-        # When steps >= 12 the denominator comes from the sim; otherwise from obs.
-        if steps >= 12:
-            log_denom = traj[:, steps - 1 - 12]
+        if transform == "mom":
+            # Kalshi rounds to 1 decimal place for MoM. Simulation is
+            # continuous; the 1dp rounding shifts the boundary by <0.05pp,
+            # which is inside our σ, so we skip explicit quantization.
+            underlying_pct = (np.exp(diffs_out[:, steps - 1]) - 1.0) * 100.0
+        elif transform == "yoy":
+            log_num = traj[:, steps - 1]
+            if steps >= 12:
+                log_denom = traj[:, steps - 1 - 12]
+            else:
+                log_denom = np.full(
+                    N, hist_tail[max(0, len(hist_tail) - 12 + steps - 1)],
+                )
+            underlying_pct = (np.exp(log_num - log_denom) - 1.0) * 100.0
         else:
-            # Observed CPI 12 months prior to the target month.
-            log_denom = np.full(N, hist_tail[steps - 1] if steps - 1 < 12 else hist_tail[-1])
-            # Precise pick: the observed log-CPI value at target_month - 12m.
-            # hist_tail holds the last 12 observed log-CPI values. At offset
-            # steps-1 in the simulation, 12 months prior is at (t*-12) which
-            # in observed-index terms is the (12-(12-steps)+... )—reduce to:
-            log_denom = np.full(N, hist_tail[max(0, len(hist_tail) - 12 + steps - 1)])
+            raise ValueError(f"unknown transform: {transform}")
 
-        log_num = traj[:, steps - 1]
-        yoy = np.exp(log_num - log_denom) - 1.0
-        yoy_pct = yoy * 100.0
-
-        # Two posteriors: over the underlying YoY (samples on the DGP) and
-        # over the binary P(YoY > threshold). The binary-posterior
-        # construction is a bootstrap over the simulation draws for
-        # epistemic-uncertainty propagation (parameter uncertainty).
+        # Bayesian bootstrap over the simulation draws for epistemic-uncertainty
+        # propagation. Apply the YES criterion element-wise, in the direction
+        # Kalshi specified.
         B = 2000
         idx = rng.integers(0, N, size=(B, N))
-        boot = yoy_pct[idx]                          # (B, N)
-        p_yes_per_boot = np.mean(boot > threshold_pct, axis=1)
+        boot = underlying_pct[idx]                    # (B, N)
+
+        if criterion.direction == "above":
+            assert criterion.low is not None
+            hit = boot > criterion.low
+        elif criterion.direction == "below":
+            assert criterion.high is not None
+            hit = boot < criterion.high
+        else:
+            assert criterion.direction == "between"
+            assert criterion.low is not None and criterion.high is not None
+            hit = (boot >= criterion.low) & (boot <= criterion.high)
+
+        p_yes_per_boot = np.mean(hit, axis=1)
         p_yes_per_boot = np.clip(p_yes_per_boot, 1e-6, 1.0 - 1e-6)
 
         fit = {"mu": mu, "phi": phi, "sigma": sigma, "n_obs": int(diff.size)}
-        return p_yes_per_boot, yoy_pct, fit
+        return p_yes_per_boot, underlying_pct, fit
 
 
 def _months_between(a: date, b: date) -> int:

@@ -1,25 +1,35 @@
 """Parse a Kalshi weather contract into structured resolution criteria.
 
-Weather markets use a small family of series/ticker patterns. We parse them
-from ``series_ticker``, ``event_ticker``, and ``ticker`` alone — not from
-``rules_primary`` — because the structured fields are stable and the rules
-text is prose. If we can't parse confidently, we return None and the
-forecaster abstains (no fake precision).
+We build three things from a Contract:
+
+1. The **location** (from the series_ticker suffix — "NY", "LAX", ...).
+2. The **target calendar date** (from the event_ticker suffix — "26APR18").
+3. The **YES criterion** (direction + threshold), taken *from Kalshi's
+   structured strike fields* — ``strike_type`` / ``cap_strike`` /
+   ``floor_strike`` — not from the ticker suffix.
+
+Why not parse the threshold from the ticker?  The ``-T{N}`` ticker suffix
+is just a threshold tag — Kalshi uses it for both "high < 61" and
+"high > 75" markets within the same series. Historically we defaulted
+``-T`` to "above" and got the sign flipped on every "less than" weather
+market, producing ~99% "YES" forecasts against markets correctly priced
+near 0¢. ``strike_type`` is the authoritative source; ticker-suffix
+parsing is a decoy. See tests/test_weather_rules.py for regressions.
 
 Examples observed in live Kalshi data (2026-04-18):
 
-    series_ticker = "KXHIGHNY"                         -> NYC daily high
-    event_ticker  = "KXHIGHNY-26APR19"                 -> 2026-04-19
-    ticker        = "KXHIGHNY-26APR19-T61"             -> P(high > 61 °F)
+    ticker        = "KXHIGHNY-26APR18-T61"
+    strike_type   = "less"
+    cap_strike    = 61
+    rules_primary = "If the highest temperature recorded in Central Park,
+                    New York for April 18, 2026 ... is less than 61°,
+                    then the market resolves to Yes."
+    → YES iff high < 61
 
-    series_ticker = "KXHIGHLAX"                        -> LAX daily high
-    ticker        = "KXHIGHLAX-26APR19-T75"            -> P(high > 75 °F)
-
-Threshold suffix grammar: ``-T<integer>`` or ``-T<integer>.<frac>``.
-
-The comparator is encoded in the prefix: ``-T`` means "above this value"
-(strict >). Kalshi sometimes also publishes ``-B`` (below) or ranged markets
-but we only keep what we can parse unambiguously. Anything else → abstain.
+    ticker        = "KXHIGHLAX-26APR19-T75"
+    strike_type   = "greater"
+    floor_strike  = 75
+    → YES iff high > 75
 """
 
 from __future__ import annotations
@@ -29,8 +39,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Literal
 
+from kalshi_edge.market.strikes import YesCriterion, parse_yes_criterion
+from kalshi_edge.types import Contract
+
 Metric = Literal["high", "low"]
-Comparator = Literal["above", "below", "equal"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,42 +87,32 @@ class WeatherContract:
     location: WeatherLocation
     target_date: date          # calendar date in the location's local TZ
     metric: Metric             # "high" or "low" daily extremum
-    threshold_f: float         # °F
-    comparator: Comparator     # how to interpret threshold for YES
+    criterion: YesCriterion    # direction + bounds, sourced from Kalshi's strike_type
 
 
 _SERIES_RE = re.compile(r"^KX(HIGH|LOW)([A-Z]+)$")
-
-# 2-digit year + 3-letter month + 2-digit day, e.g. "26APR19".
 _EVENT_DATE_RE = re.compile(r"-(\d{2})([A-Z]{3})(\d{2})(?:-|$)")
-
-# Threshold grammar in the ticker suffix. Only strictly-"above" (-T) is
-# parsed; other comparator conventions abstain rather than guess.
-_THRESHOLD_RE = re.compile(r"-T(-?\d+(?:\.\d+)?)$")
 
 _MONTHS = {m: i + 1 for i, m in enumerate(
     ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"])}
 
 
-def parse_weather_contract(
-    series_ticker: str, event_ticker: str, ticker: str,
-) -> WeatherContract | None:
+def parse_weather_contract(contract: Contract) -> WeatherContract | None:
     """Return structured criteria, or None if the ticker isn't parseable.
 
-    Abstaining on unknown locations / malformed tickers is intentional: the
-    forecaster must not invent a threshold or a date we don't understand.
+    Abstaining on unknown locations / missing strike fields is intentional:
+    the forecaster must not invent a threshold direction we don't know.
     """
-    ser = series_ticker.upper().strip()
+    ser = contract.series_ticker.upper().strip()
     msm = _SERIES_RE.match(ser)
     if not msm:
         return None
     metric: Metric = "high" if msm.group(1) == "HIGH" else "low"
-    city_slug = msm.group(2)
-    loc = _LOCATIONS.get(city_slug)
+    loc = _LOCATIONS.get(msm.group(2))
     if loc is None:
         return None
 
-    mdate = _EVENT_DATE_RE.search(event_ticker.upper())
+    mdate = _EVENT_DATE_RE.search(contract.event_ticker.upper())
     if not mdate:
         return None
     yy = int(mdate.group(1))
@@ -120,17 +122,15 @@ def parse_weather_contract(
         return None
     target_date = date(2000 + yy, mon, dd)
 
-    mthr = _THRESHOLD_RE.search(ticker.upper())
-    if not mthr:
+    criterion = parse_yes_criterion(contract.raw or {})
+    if criterion is None:
         return None
-    threshold_f = float(mthr.group(1))
 
     return WeatherContract(
         location=loc,
         target_date=target_date,
         metric=metric,
-        threshold_f=threshold_f,
-        comparator="above",
+        criterion=criterion,
     )
 
 
