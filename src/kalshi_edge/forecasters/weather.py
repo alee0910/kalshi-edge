@@ -134,10 +134,32 @@ class WeatherForecaster(Forecaster):
             return self._null(contract, f"ensemble_too_small: {members.size}")
 
         result = self._posterior_from_members(members, wc)
+
+        # Raw empirical P (no variance inflation, no bootstrap) — useful
+        # as a sanity-check reference against the posterior mean.
+        crit = wc.criterion
+        if crit.direction == "above":
+            raw_p = float((members > crit.low).mean())  # type: ignore[arg-type]
+        elif crit.direction == "below":
+            raw_p = float((members < crit.high).mean())  # type: ignore[arg-type]
+        else:
+            raw_p = float(
+                ((members >= crit.low) & (members <= crit.high)).mean()
+            )
+
+        q = np.percentile(members, [5, 25, 50, 75, 95]).round(2).tolist()
         diagnostics = {
             "n_members": int(members.size),
-            "ensemble_mean_f": float(np.mean(members)),
-            "ensemble_std_f": float(np.std(members, ddof=1)),
+            "ensemble_mean_f": round(float(np.mean(members)), 2),
+            "ensemble_median_f": round(float(np.median(members)), 2),
+            "ensemble_std_f": round(float(np.std(members, ddof=1)), 2),
+            "ensemble_min_f": round(float(members.min()), 2),
+            "ensemble_max_f": round(float(members.max()), 2),
+            "ensemble_q05_f": q[0],
+            "ensemble_q25_f": q[1],
+            "ensemble_q75_f": q[3],
+            "ensemble_q95_f": q[4],
+            "raw_empirical_p_yes": round(raw_p, 4),
             "variance_inflation": self.kappa,
             "yes_direction": wc.criterion.direction,
             "yes_low_f": wc.criterion.low,
@@ -155,12 +177,29 @@ class WeatherForecaster(Forecaster):
             underlying_posterior=result["underlying"],
             model_confidence=result["confidence"],
             methodology={
-                "model": "pooled ensemble (GFS+ECMWF) with variance inflation",
-                "prior": f"variance_inflation kappa={self.kappa} (NWP underdispersion)",
-                "likelihood": "per-member daily extremum in local-day window",
-                "posterior_over_p": "Bayesian bootstrap over ensemble members",
-                "inflation_rationale": "GEFS/ECMWF 2m-T are empirically underdispersive "
-                                       "at 1-7d lead; kappa ~ 1.2-1.5 typical.",
+                "model": "pooled 82-member ensemble (GFS-ENS 31 + ECMWF-IFS 51) "
+                         "at 25 km grid",
+                "threshold_test": (
+                    "empirical count of members satisfying the YES criterion "
+                    "(no Gaussian-CDF approximation)"
+                ),
+                "prior": (
+                    f"variance_inflation kappa={self.kappa}: each member's "
+                    f"deviation from the ensemble mean is scaled by kappa to "
+                    f"correct NWP underdispersion at 1-7d lead"
+                ),
+                "posterior_over_p": (
+                    "Bayesian bootstrap over inflated members (2000 draws); "
+                    "P(YES) per draw is the empirical fraction above/below "
+                    "the threshold — preserves any bimodality/skew in the "
+                    "raw ensemble"
+                ),
+                "grid_resolution_caveat": (
+                    "25 km cells don't resolve coastal marine-layer / urban "
+                    "microclimate — ensemble can bias warm at LAX-type "
+                    "shoreline stations; treat disagreements with liquid "
+                    "markets as a flag for this known limitation"
+                ),
             },
             data_sources={"open_meteo_ensemble": fetch.fetched_at},
             diagnostics=diagnostics,
@@ -170,69 +209,73 @@ class WeatherForecaster(Forecaster):
     def _posterior_from_members(
         self, members: np.ndarray, wc: WeatherContract,
     ) -> dict:
-        """Build binary + underlying posteriors from the pooled member array."""
-        mu = float(np.mean(members))
-        # Sample std, then inflated std clamped to the floor.
-        sigma_raw = float(np.std(members, ddof=1))
-        sigma = max(sigma_raw * self.kappa, MIN_POSTERIOR_STD_F)
+        """Build binary + underlying posteriors from the pooled member array.
 
-        # Underlying posterior: Gaussian(mu, sigma_inflated) on °F.
-        # Stored as a parametric distribution so the dashboard can render a
-        # closed-form density overlay against the market-implied mixture.
+        Empirical bootstrap — not Gaussian-on-moments. Principle 4 of the
+        methodology says "we do *not* collapse to (mean, std) before
+        computing the threshold probability." Prior versions of this code
+        fit a Gaussian to each bootstrap resample and took 1-Φ(z). That
+        inflates tail mass whenever the ensemble is bimodal or skewed —
+        e.g. LAX on a Santa Ana / marine-layer boundary day where
+        members split into "burns off" and "stays cool" clusters. We
+        instead count the fraction of (inflation-scaled) members that
+        satisfy the YES criterion directly.
+        """
+        mu = float(np.mean(members))
+        sigma_raw = float(np.std(members, ddof=1))
+        # Underlying posterior: Gaussian(mu, inflated sigma) — kept as a
+        # *description* of the ensemble for the dashboard density overlay.
+        # Not used to compute P(YES).
+        underlying_sigma = max(sigma_raw * self.kappa, MIN_POSTERIOR_STD_F)
         underlying = ForecastDistribution(
             kind="parametric", family="normal",
-            params={"loc": mu, "scale": sigma},
+            params={"loc": mu, "scale": underlying_sigma},
         )
 
-        # Binary posterior: Bayesian bootstrap over ensemble members. For
-        # each bootstrap draw we resample the members with replacement,
-        # compute the bootstrap Gaussian fit to that resample, and derive
-        # the threshold probability. The *distribution* of those
-        # probabilities is our posterior over p — it captures within-model
-        # sampling uncertainty on top of the aleatoric spread.
-        n = members.size
-        idx = self.rng.integers(0, n, size=(_BOOTSTRAP_DRAWS, n))
-        boot = members[idx]                                           # (B, n)
-        bmu = boot.mean(axis=1)
-        bsd = boot.std(axis=1, ddof=1)
-        # Inflate per bootstrap draw and clamp.
-        bsd = np.maximum(bsd * self.kappa, MIN_POSTERIOR_STD_F)
+        # Variance inflation on the members themselves. Scale each
+        # member's deviation from the pooled mean by kappa — this widens
+        # the ensemble without altering its shape (bimodality / skew
+        # preserved). A sub-kappa-floor sigma is rescued to the floor by
+        # pulling members toward the mean proportionally.
+        if sigma_raw > 0:
+            scale = max(self.kappa, MIN_POSTERIOR_STD_F / sigma_raw)
+        else:
+            scale = 1.0
+        inflated = mu + (members - mu) * scale
 
-        # P(YES) via the Gaussian CDF, per bootstrap draw. The YES direction
-        # comes from Kalshi's strike_type field, not from any ticker-suffix
-        # convention — see weather_rules.parse_weather_contract.
-        from scipy.stats import norm
+        # Bayesian bootstrap: resample members (with replacement) to
+        # propagate *ensemble-sampling uncertainty* into a posterior
+        # over P(YES). Per draw we count the empirical fraction of
+        # members satisfying the YES criterion. No Gaussian assumption.
+        n = inflated.size
+        idx = self.rng.integers(0, n, size=(_BOOTSTRAP_DRAWS, n))
+        boot = inflated[idx]                                          # (B, n)
+
         crit = wc.criterion
         if crit.direction == "above":
             assert crit.low is not None
-            z = (crit.low - bmu) / bsd
-            p_yes_samples = 1.0 - norm.cdf(z)
+            hit = boot > crit.low
         elif crit.direction == "below":
             assert crit.high is not None
-            z = (crit.high - bmu) / bsd
-            p_yes_samples = norm.cdf(z)
+            hit = boot < crit.high
         else:
             assert crit.direction == "between"
             assert crit.low is not None and crit.high is not None
-            z_hi = (crit.high - bmu) / bsd
-            z_lo = (crit.low - bmu) / bsd
-            p_yes_samples = norm.cdf(z_hi) - norm.cdf(z_lo)
+            hit = (boot >= crit.low) & (boot <= crit.high)
+        p_yes_samples = hit.mean(axis=1)
 
-        # Numerical guard. Even with clamping, float underflow near the tails
-        # can pin samples to exact 0/1, which the entropy decomposition then
-        # handles by clipping — but it's cleaner to clip here and log.
+        # Numerical guard. Even with an 82-member ensemble, a degenerate
+        # bootstrap draw can be exactly 0 or 1; clip away from the tails
+        # so the entropy decomposition in base.finalize doesn't NaN.
         p_yes_samples = np.clip(p_yes_samples, 1e-6, 1.0 - 1e-6)
 
         binary = ForecastDistribution(kind="samples", samples=p_yes_samples)
 
-        # Model confidence: high when ensemble is wide enough to be
-        # informative and days_ahead is small. We fuse two signals:
-        #   (a) relative spread of p: narrow → more confident
-        #   (b) ensemble sigma is in a reasonable range (not collapsed,
-        #       not explosively wide)
+        # Model confidence: high when P is concentrated (ensemble members
+        # agree on whether the threshold is cleared) and raw sigma is in
+        # a sensible range.
         p_spread = float(np.std(p_yes_samples))
-        confidence = float(np.exp(-4.0 * p_spread))  # ~1.0 at p_spread=0, ~0.37 at 0.25
-        # Penalize extreme raw sigma (collapsed ensemble is suspicious).
+        confidence = float(np.exp(-4.0 * p_spread))
         if sigma_raw < 0.3 or sigma_raw > 15.0:
             confidence *= 0.5
 

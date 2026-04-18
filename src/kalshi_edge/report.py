@@ -318,6 +318,15 @@ tr:nth-child(even) td { background: var(--row-alt); }
     border-radius: 4px; font-size: 12px; line-height: 1.5;
 }
 .detail-warn b { color: #fde68a; }
+.detail-narrative p {
+    margin: 0 0 8px; line-height: 1.6; font-size: 12.5px; color: #d4d8dd;
+}
+.detail-narrative p b { color: var(--fg); font-weight: 600; }
+.detail-narrative p.detail-caveat {
+    color: #f8c377; background: #1d1814; border-left: 2px solid #b06a1f;
+    padding: 6px 10px; border-radius: 3px; font-size: 12px;
+}
+.detail-narrative p.detail-caveat b { color: #fde4bd; }
 .kv {
     display: grid;
     grid-template-columns: 220px 1fr;
@@ -514,6 +523,150 @@ def _kv_block(d: dict[str, Any]) -> str:
     return "".join(rows)
 
 
+def _weather_edge_narrative(r: _Row, mid: float | None) -> str:
+    """Plain-English 'why this edge?' block for weather forecasts.
+
+    Builds a short paragraph from the enriched ensemble diagnostics so the
+    user can see *what* drove P(YES) — the ensemble's central tendency,
+    where the YES threshold sits inside the ensemble distribution, the
+    raw empirical hit-rate before any correction, and how much the
+    variance-inflation step moves the number. Without this, the detail
+    panel shows a flat kv grid and the driver of a surprising edge is
+    opaque.
+
+    Returns '' when the forecast isn't a weather-ensemble result or the
+    diagnostics don't carry the expected keys (older rows, partial
+    migrations).
+    """
+    if r.fc_forecaster != "weather_ensemble":
+        return ""
+    d = r.fc_diagnostics
+    needed = {"ensemble_mean_f", "ensemble_std_f", "yes_direction",
+              "raw_empirical_p_yes", "n_members"}
+    if not needed.issubset(d.keys()):
+        return ""
+
+    try:
+        mu = float(d["ensemble_mean_f"])
+        sigma = float(d["ensemble_std_f"])
+        direction = str(d["yes_direction"])
+        raw_p = float(d["raw_empirical_p_yes"])
+        n = int(d["n_members"])
+    except (TypeError, ValueError):
+        return ""
+
+    median = d.get("ensemble_median_f")
+    mn = d.get("ensemble_min_f")
+    mx = d.get("ensemble_max_f")
+    q05 = d.get("ensemble_q05_f")
+    q95 = d.get("ensemble_q95_f")
+    kappa = d.get("variance_inflation")
+    low = d.get("yes_low_f")
+    high = d.get("yes_high_f")
+
+    if direction == "above" and low is not None:
+        thr_txt = f"&gt; {low:g}&deg;F"
+        z = (float(low) - mu) / sigma if sigma > 0 else 0.0
+        placement = (
+            f"the YES threshold ({low:g}&deg;F) sits <b>{z:+.2f}&sigma;</b> from "
+            f"the ensemble mean"
+        )
+    elif direction == "below" and high is not None:
+        thr_txt = f"&lt; {high:g}&deg;F"
+        z = (float(high) - mu) / sigma if sigma > 0 else 0.0
+        placement = (
+            f"the YES threshold ({high:g}&deg;F) sits <b>{z:+.2f}&sigma;</b> "
+            f"from the ensemble mean"
+        )
+    elif direction == "between" and low is not None and high is not None:
+        thr_txt = f"in [{low:g}, {high:g}]&deg;F"
+        placement = (
+            f"the YES band spans {low:g}–{high:g}&deg;F around the ensemble "
+            f"mean of {mu:g}&deg;F"
+        )
+    else:
+        return ""
+
+    central = f"mean <b>{mu:g}&deg;F</b>"
+    if median is not None:
+        central += f", median {median:g}&deg;F"
+    central += f", std {sigma:g}&deg;F"
+
+    spread_bits: list[str] = []
+    if q05 is not None and q95 is not None:
+        spread_bits.append(f"90% of members fall in [{q05:g}, {q95:g}]&deg;F")
+    if mn is not None and mx is not None:
+        spread_bits.append(f"full range [{mn:g}, {mx:g}]&deg;F")
+
+    fair_p = r.fc_p_yes if r.fc_p_yes is not None else None
+    fair_pct_txt = f"{fair_p * 100:.1f}%" if fair_p is not None else "—"
+    raw_pct_txt = f"{raw_p * 100:.1f}%"
+
+    model_line: str
+    if kappa is not None:
+        model_line = (
+            f"We widen each member's deviation from the mean by "
+            f"<b>&kappa;={kappa:g}</b> (a published correction for NWP "
+            f"ensembles being ~20-50% too narrow at 1-7d lead), then "
+            f"Bayesian-bootstrap the inflated members {_BOOTSTRAP_DRAWS_TXT} "
+            f"times to get a distribution over P(YES). Posterior mean: "
+            f"<b>{fair_pct_txt}</b>."
+        )
+    else:
+        model_line = f"Posterior mean P(YES): <b>{fair_pct_txt}</b>."
+
+    market_line = ""
+    if mid is not None and fair_p is not None:
+        delta = fair_p * 100.0 - mid
+        market_line = (
+            f" The market prices this at <b>{mid:.0f}&cent;</b>, so the "
+            f"edge is <b>{delta:+.1f}&cent;</b> = model − market."
+        )
+
+    # The "1-7d lead" correction is the published regime where GEFS/ECMWF
+    # 2m-T ensembles are known underdispersive. Beyond that it's less
+    # settled — flag when the user is looking at a far-out forecast.
+    days_ahead = d.get("days_ahead")
+    caveats: list[str] = []
+    if isinstance(days_ahead, (int, float)) and days_ahead > 7:
+        caveats.append(
+            f"Target is <b>{int(days_ahead)} days out</b>, beyond the 1-7d "
+            f"window where our &kappa; calibration is strongest — treat the "
+            f"number as weaker than it would be at short lead."
+        )
+    # Big market/model divergence on coastal sites: the 25km grid can't
+    # see the marine layer, so "LAX high" forecasts run warm vs actual
+    # observations. Only mention when the divergence is notable.
+    if mid is not None and fair_p is not None and abs(fair_p * 100 - mid) >= 15:
+        slug_hint = ""
+        if "LAX" in r.ticker.upper():
+            slug_hint = (
+                "This is an LAX (coastal) site, where a 25 km grid "
+                "can't resolve the marine-layer temperature inversion. "
+                "Expect a systematic warm bias on days the layer "
+                "persists; treat disagreements against a liquid market "
+                "as a flag for this limitation."
+            )
+        if slug_hint:
+            caveats.append(slug_hint)
+
+    bits: list[str] = [
+        f"<p><b>Ensemble ({n} members):</b> {central}."
+        + (f" {'; '.join(spread_bits)}." if spread_bits else "")
+        + "</p>",
+        f"<p><b>Threshold placement:</b> {placement}; raw fraction of "
+        f"members satisfying YES ({thr_txt}) is <b>{raw_pct_txt}</b> "
+        f"(no inflation, no bootstrap — this is the ensemble's vote).</p>",
+        f"<p><b>Model step:</b> {model_line}{market_line}</p>",
+    ]
+    for c in caveats:
+        bits.append(f"<p class=detail-caveat><b>Caveat:</b> {c}</p>")
+    return "".join(bits)
+
+
+_BOOTSTRAP_DRAWS_TXT = "2000"
+
+
 def _sanity_warnings(r: _Row, mid: float | None, edge_pts: float | None) -> list[str]:
     """Heuristic sanity flags for extreme model-vs-market disagreement.
 
@@ -613,6 +766,15 @@ def _build_detail_html(r: _Row, mid: float | None) -> str:
         for w in _sanity_warnings(r, mid, edge_pts)
     ]
 
+    narrative = _weather_edge_narrative(r, mid)
+    narrative_block = (
+        "<div class=detail-section>"
+        "<div class=detail-h>Why this edge?</div>"
+        f"<div class=detail-narrative>{narrative}</div>"
+        "</div>"
+        if narrative else ""
+    )
+
     return (
         "<div class=detail-card>"
         + meta
@@ -620,6 +782,7 @@ def _build_detail_html(r: _Row, mid: float | None) -> str:
         + "<div class=detail-section><div class=detail-h>Pricing breakdown</div>"
         + "".join(pricing_lines)
         + "</div>"
+        + narrative_block
         + "<div class=detail-section><div class=detail-h>How this edge was computed</div>"
         + _kv_block(r.fc_methodology)
         + "</div>"
