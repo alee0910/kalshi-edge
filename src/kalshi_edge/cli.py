@@ -19,6 +19,10 @@ from kalshi_edge.logging_ import configure, get_logger
 from kalshi_edge.market import KalshiClient, UniverseFilter
 from kalshi_edge.market.parser import UnsupportedMarket, parse_market
 from kalshi_edge.report import write_report, write_quantamental_report
+from kalshi_edge.backtest.persistence import dump_tables_to_ndjson
+from kalshi_edge.backtest.report_html import write_backtest_report
+from kalshi_edge.backtest.resolutions import pull_series_resolutions
+from kalshi_edge.backtest.retro_market import retro_calibrate_series
 from kalshi_edge.storage import Database
 from kalshi_edge.types import Category
 
@@ -29,6 +33,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_ANALYST_INPUTS = _REPO_ROOT / "analyst_inputs"
 _DEFAULT_BRIEFS_DIR = _REPO_ROOT / "site" / "quantamental" / "briefs"
 _DEFAULT_QUANT_DIR = _REPO_ROOT / "site" / "quantamental"
+_DEFAULT_DATA_DIR = _REPO_ROOT / "_data"
+_DEFAULT_BACKTEST_HTML = _REPO_ROOT / "site" / "quantamental" / "backtest.html"
 
 
 @click.group()
@@ -456,3 +462,146 @@ def build_briefs(
 
     written = write_briefs(contexts, out_dir)
     click.echo(f"wrote {len(written)} briefs to {out_dir}")
+
+
+# ----------------------------------------------------------------------
+# Backtest pipeline
+# ----------------------------------------------------------------------
+
+
+_DEFAULT_RESOLUTION_SERIES = (
+    "KXHIGHNY,KXHIGHLAX,KXHIGHCHI,KXHIGHMIA,KXHIGHAUS,KXHIGHDEN,KXHIGHPHIL,"
+    "KXHIGHPHX,KXCPIYOY,KXCPI,KXFED,KXFEDDECISION,KXNBAGAME,KXNHL,KXATPMATCH,"
+    "KXMLBGAME,KXPRES,KXSEN,KXHOUSE,KXGOV,KXELECT,KXPRIMARY"
+)
+
+
+@main.command("dump-history")
+@click.option("--out", "out_dir", type=click.Path(path_type=Path),
+              default=_DEFAULT_DATA_DIR,
+              help="Root directory for the NDJSON corpus (typically a worktree of the "
+                   "data-snapshots branch).")
+@click.pass_obj
+def dump_history(cfg, out_dir: Path) -> None:  # type: ignore[no-untyped-def]
+    """Append the current DB's forecasts / snapshots / resolutions to NDJSON."""
+    db = Database(cfg.storage.sqlite_path, wal=cfg.storage.wal_mode)
+    written = dump_tables_to_ndjson(db, out_dir)
+    click.echo(
+        "dumped "
+        + " ".join(f"{k}={v}" for k, v in written.items())
+        + f" to {out_dir}"
+    )
+
+
+@main.command("pull-resolutions")
+@click.option("--series", "series_csv", default=_DEFAULT_RESOLUTION_SERIES, show_default=False,
+              help="Comma-separated Kalshi series to scan for settled markets.")
+@click.option("--since", "since_iso", type=str, default=None,
+              help="Earliest resolved_at to keep (ISO-8601 UTC). Defaults to 48h ago.")
+@click.option("--max-per-series", type=int, default=500, show_default=True,
+              help="Pagination cap per series (protects against an unbounded walk).")
+@click.pass_obj
+def pull_resolutions(cfg, series_csv: str, since_iso: str | None, max_per_series: int) -> None:  # type: ignore[no-untyped-def]
+    """Fetch settled Kalshi markets and write rows to the ``resolutions`` table."""
+    log = get_logger("cli.pull_resolutions")
+    since = _parse_iso_or_default_hours_ago(since_iso, hours=48)
+    series_list = tuple(s.strip() for s in series_csv.split(",") if s.strip())
+
+    client = KalshiClient(cfg.kalshi)
+    db = Database(cfg.storage.sqlite_path, wal=cfg.storage.wal_mode)
+    results = pull_series_resolutions(
+        client, db, series_tickers=series_list, since=since,
+        max_per_series=max_per_series,
+    )
+    total_seen = sum(r.n_seen for r in results)
+    total_written = sum(r.n_resolved for r in results)
+    log.info("pull_resolutions_done", n_series=len(results),
+             total_seen=total_seen, total_written=total_written)
+    click.echo(f"series={len(results)} seen={total_seen} resolutions_written={total_written}")
+
+
+@main.command("backtest")
+@click.option("--data-dir", type=click.Path(path_type=Path),
+              default=_DEFAULT_DATA_DIR,
+              help="NDJSON corpus root (usually a worktree of the data-snapshots branch).")
+@click.option("--out", "out_path", type=click.Path(path_type=Path),
+              default=_DEFAULT_BACKTEST_HTML,
+              help="HTML output path for the backtest report.")
+@click.option("--edge-threshold-cents", type=float, default=5.0, show_default=True,
+              help="Minimum |edge| in cents for the hypothetical flat-stake PnL sim.")
+def backtest_cmd(data_dir: Path, out_path: Path, edge_threshold_cents: float) -> None:
+    """Score the NDJSON forecast corpus out-of-sample and render HTML."""
+    log = get_logger("cli.backtest")
+    n = write_backtest_report(
+        data_dir, out_path,
+        edge_threshold_cents=edge_threshold_cents,
+    )
+    log.info("backtest_written", out=str(out_path), bytes=n)
+    click.echo(f"wrote {n} bytes to {out_path}")
+
+
+@main.command("retro-market-calibration")
+@click.option("--series", "series_ticker", required=True,
+              help="Kalshi series to retro-calibrate, e.g. KXNBAGAME.")
+@click.option("--since", "since_iso", required=True,
+              help="Earliest close_time to include (ISO-8601 UTC), e.g. 2026-01-18.")
+@click.option("--until", "until_iso", default=None,
+              help="Latest close_time to include. Defaults to now.")
+@click.option("--max-markets", type=int, default=None,
+              help="Cap on markets walked (for spot-checks).")
+@click.option("--candle-minutes", type=int, default=60, show_default=True,
+              help="Candlestick interval in minutes; we read the last bar before close.")
+@click.pass_obj
+def retro_market_calibration_cmd(  # type: ignore[no-untyped-def]
+    cfg, series_ticker: str, since_iso: str, until_iso: str | None,
+    max_markets: int | None, candle_minutes: int,
+) -> None:
+    """Score Kalshi's own closing prices against outcomes for a series window.
+
+    This is the baseline our forecaster must beat: it does not run any
+    forecaster, it only evaluates the market itself. Useful for domains
+    where historical forecaster inputs aren't free (e.g. sports odds).
+    """
+    log = get_logger("cli.retro_market")
+    since = _parse_iso(since_iso)
+    if since is None:
+        raise click.BadParameter(f"could not parse --since={since_iso!r}")
+    until = _parse_iso(until_iso) if until_iso else None
+
+    client = KalshiClient(cfg.kalshi)
+    summary = retro_calibrate_series(
+        client, series_ticker,
+        since=since, until=until,
+        max_markets=max_markets, candle_minutes=candle_minutes,
+    )
+    log.info(
+        "retro_market_summary",
+        series=summary.series, n_markets=summary.n_markets,
+        n_scored=summary.n_scored,
+        mean_brier=summary.mean_brier, mean_log_loss=summary.mean_log_loss,
+    )
+    click.echo(
+        f"series={summary.series} n_markets={summary.n_markets} "
+        f"n_scored={summary.n_scored} "
+        f"brier={summary.mean_brier} log_loss={summary.mean_log_loss}"
+    )
+
+
+def _parse_iso(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_iso_or_default_hours_ago(s: str | None, *, hours: int) -> datetime:
+    dt = _parse_iso(s)
+    if dt is not None:
+        return dt
+    from datetime import timedelta
+    return datetime.now(timezone.utc) - timedelta(hours=hours)

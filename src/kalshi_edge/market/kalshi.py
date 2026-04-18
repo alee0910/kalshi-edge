@@ -76,6 +76,10 @@ class KalshiClient:
         "orderbook": "/markets/{ticker}/orderbook",
         "event_detail": "/events/{ticker}",
         "series_detail": "/series/{ticker}",
+        # Historical candlesticks live under the series — Kalshi's API
+        # requires the series ticker as a path parameter. Used for the
+        # retro-market-calibration backtest.
+        "candlesticks": "/series/{series}/markets/{ticker}/candlesticks",
     }
 
     def __init__(
@@ -206,6 +210,47 @@ class KalshiClient:
         data = self._get(self._ENDPOINTS["series_detail"].format(ticker=ticker))
         return dict(data)
 
+    def get_candlesticks(
+        self,
+        series_ticker: str,
+        market_ticker: str,
+        *,
+        start_ts: int | datetime,
+        end_ts: int | datetime,
+        period_interval: int = 60,
+    ) -> list[dict[str, Any]]:
+        """Fetch historical candlesticks for one settled/live market.
+
+        Kalshi's candlesticks endpoint returns OHLC + volume bars at a
+        chosen interval (minutes). We use it to recover the closing market
+        price for a settled contract without needing a live orderbook.
+
+        ``start_ts`` / ``end_ts`` may be given as Unix seconds or datetimes;
+        Kalshi caps a single call's window (typically 5000 bars), so the
+        caller is expected to size intervals appropriately for long ranges.
+        """
+        params = {
+            "start_ts": _unix_seconds(start_ts),
+            "end_ts": _unix_seconds(end_ts),
+            "period_interval": int(period_interval),
+        }
+        data = self._get(
+            self._ENDPOINTS["candlesticks"].format(
+                series=series_ticker, ticker=market_ticker,
+            ),
+            params=params,
+        )
+        return list(data.get("candlesticks") or [])
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _unix_seconds(ts: int | datetime) -> int:
+    """Normalize a (timezone-aware) datetime or int to Unix seconds."""
+    if isinstance(ts, datetime):
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return int(ts.timestamp())
+    return int(ts)

@@ -1180,6 +1180,7 @@ def _quantamental_page_shell(title: str, body: str, *, now: datetime) -> str:
         "<a href='./index.html'>Overview</a>"
         "<a href='./research_queue.html'>Research queue</a>"
         "<a href='./calibration_split.html'>Calibration split</a>"
+        "<a href='./backtest.html'>Backtest</a>"
         "<a href='./briefs/'>Briefs</a>"
         "<a href='../index.html'>← Universe</a>"
         "</div>"

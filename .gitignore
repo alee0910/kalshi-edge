@@ -52,3 +52,7 @@ data/blobs/
 
 # Generated static report (rebuilt by CI)
 site/
+
+# Local worktree checkout of the data-snapshots branch. Never tracked on
+# main — the branch itself lives upstream and is managed by CI.
+_data/

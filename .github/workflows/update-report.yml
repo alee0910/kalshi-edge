@@ -17,7 +17,7 @@ on:
     branches: [main]      # also rebuild whenever code / config changes
 
 permissions:
-  contents: read
+  contents: write        # needed to push to data-snapshots branch
   pages: write
   id-token: write
 
@@ -101,6 +101,71 @@ jobs:
         # calibration split. Linked *from* the nav-sub inside the subsite
         # only; the universe page intentionally does not link down.
         run: uv run kalshi-edge build-quantamental --out site/quantamental
+
+      - name: Check out data-snapshots corpus
+        # Checkout the orphan branch that accumulates our NDJSON forecast
+        # history. The branch is created on first run below if missing.
+        uses: actions/checkout@v4
+        with:
+          ref: data-snapshots
+          path: _data
+        continue-on-error: true
+
+      - name: Ensure data-snapshots worktree
+        # First-run bootstrap: if the branch doesn't exist yet, initialize
+        # an orphan commit locally and let the push step create the
+        # upstream branch. Idempotent — a no-op on subsequent runs.
+        run: |
+          if [ ! -d _data/.git ]; then
+            rm -rf _data
+            mkdir _data
+            cd _data
+            git init -q -b data-snapshots
+            git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}"
+            git commit --allow-empty -q -m "initial data-snapshots branch"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
+      - name: Pull Kalshi resolutions
+        # Walks the configured series for recently settled markets and
+        # writes outcomes to the ``resolutions`` table so the NDJSON dump
+        # captures them. 48h window is enough given a 30m cron — we don't
+        # want to re-ingest the whole settled archive each run.
+        run: uv run kalshi-edge pull-resolutions
+
+      - name: Dump DB to NDJSON corpus
+        # Appends today's forecasts / snapshots / resolutions / contracts
+        # to the data-snapshots worktree. Idempotent within a UTC day.
+        run: uv run kalshi-edge dump-history --out _data
+
+      - name: Commit + push data-snapshots
+        # Only pushes if there is actual content to add; a no-op run (e.g.
+        # a re-trigger in the same minute) makes no commit.
+        run: |
+          cd _data
+          git config user.name  "kalshi-edge-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "data-snapshots: nothing new to commit"
+          else
+            git commit -q -m "data snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            # Force push is safe here: we're the only writer and the branch
+            # is orphan / append-only — avoids fast-forward failures if a
+            # concurrent run raced us.
+            git push -u -f origin data-snapshots
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build backtest report
+        # Reads the accumulated NDJSON corpus (including the commit we
+        # just made) and writes site/quantamental/backtest.html. Safe to
+        # run even when the corpus is empty — produces a "no data yet"
+        # placeholder.
+        run: uv run kalshi-edge backtest --data-dir _data --out site/quantamental/backtest.html
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
