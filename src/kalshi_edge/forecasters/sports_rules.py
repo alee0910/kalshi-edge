@@ -63,10 +63,17 @@ def parse_sports_contract(
 def _team_tokens(team: str) -> list[str]:
     """Return candidate substrings that a Kalshi title might contain.
 
-    odds-api returns e.g. "Chicago White Sox"; Kalshi titles may say
-    "White Sox", "Sox", or "Chicago". We check the last word (mascot) and
-    the full string. Last word is usually the strongest signal and also
-    the only one common to both compact and verbose titles.
+    odds-api returns verbose names like "Toronto Raptors" or "Chicago
+    White Sox". Kalshi titles come in multiple formats across leagues:
+
+    - NBA: "Toronto at Cleveland Winner?"       (city only)
+    - MLB: "Will the White Sox beat the Athletics?"  (mascot only)
+    - NHL: occasionally full name.
+
+    So we check the full string, the last 1-2 words (mascot), *and* the
+    leading words (city). When both teams in a game share a city
+    (Los Angeles Lakers/Clippers, Chicago Cubs/White Sox), match_game's
+    ambiguity check still kicks in and we abstain rather than guess.
     """
     t = team.strip()
     if not t:
@@ -74,9 +81,17 @@ def _team_tokens(team: str) -> list[str]:
     parts = t.split()
     out = [t.lower()]
     if len(parts) >= 2:
-        # last 2 words (e.g. "White Sox"), and the last word alone
-        out.append(" ".join(parts[-2:]).lower())
-        out.append(parts[-1].lower())
+        out.append(" ".join(parts[-2:]).lower())   # last 2 words (often "City Mascot")
+        out.append(parts[-1].lower())               # mascot alone (e.g. "Raptors")
+        out.append(" ".join(parts[:-1]).lower())   # city if mascot is 1 word
+        # Also handle 3-word teams where the mascot itself is 2 words
+        # ("White Sox", "Red Sox", "Blue Jays"). The single-word "city" is
+        # "Chicago" / "Boston" / "Toronto". Skip short leading particles
+        # ("Los", "San", "New") — too noisy to match against.
+        if len(parts) >= 3:
+            city_alt = " ".join(parts[:-2]).lower()
+            if len(city_alt) >= 4:
+                out.append(city_alt)
     elif parts:
         out.append(parts[0].lower())
     return out

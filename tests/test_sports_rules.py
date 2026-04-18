@@ -65,6 +65,31 @@ def test_match_game_away_team_first() -> None:
     assert team == "Oakland Athletics"
 
 
+def test_match_game_nba_city_only_title() -> None:
+    """Regression: Kalshi NBA contracts use "City at City Winner?" format.
+
+    The-odds-api returns "Toronto Raptors" / "Cleveland Cavaliers"; the
+    Kalshi title mentions only the cities. We need to match by the
+    leading-words (city) token, not just the mascot.
+    """
+    sc = parse_sports_contract("KXNBAGAME", "KXNBAGAME-26APR18TORCLE")
+    assert sc is not None
+    game = Game(
+        sport_key="basketball_nba",
+        game_id="g1",
+        commence_time=datetime(2026, 4, 18, 17, 0, tzinfo=timezone.utc),
+        home_team="Cleveland Cavaliers",
+        away_team="Toronto Raptors",
+        outcomes=[],
+        fetched_at=datetime.now(timezone.utc),
+    )
+    res = match_game(sc, "Toronto at Cleveland Winner?", [game])
+    assert res is not None
+    _, team = res
+    # "Toronto" is mentioned first → that's the YES team.
+    assert team == "Toronto Raptors"
+
+
 def test_match_game_et_date_wraps_to_next_utc_day() -> None:
     """Regression: NBA 8pm-ET tips convert to 00:00 UTC the *next* day.
 
