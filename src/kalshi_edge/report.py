@@ -15,11 +15,13 @@ shown for universe transparency.
 from __future__ import annotations
 
 import html
+import json
 import sqlite3
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from kalshi_edge.storage import Database
 
@@ -31,6 +33,7 @@ class _Row:
     series_ticker: str
     category: str
     title: str
+    subtitle: str | None   # Kalshi's yes_sub_title — labels what YES resolves on
     close_time: datetime | None
     yes_bid: float | None
     yes_ask: float | None
@@ -44,18 +47,26 @@ class _Row:
     fc_model_confidence: float | None
     fc_null_reason: str | None
     fc_forecaster: str | None
+    fc_version: str | None
     fc_ts: datetime | None
+    fc_methodology: dict[str, Any] = field(default_factory=dict)
+    fc_data_sources: dict[str, Any] = field(default_factory=dict)
+    fc_diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 _QUERY = """
 SELECT
-    c.ticker, c.event_ticker, c.series_ticker, c.category, c.title, c.close_time,
+    c.ticker, c.event_ticker, c.series_ticker, c.category, c.title, c.subtitle, c.close_time,
     s.yes_bid, s.yes_ask, s.volume_24h, s.liquidity, s.ts AS snapshot_ts,
     f.p_yes AS fc_p_yes, f.p_yes_p05 AS fc_p05, f.p_yes_p95 AS fc_p95,
     f.model_confidence AS fc_model_confidence,
     f.null_reason AS fc_null_reason,
     f.forecaster AS fc_forecaster,
-    f.ts AS fc_ts
+    f.version AS fc_version,
+    f.ts AS fc_ts,
+    f.methodology AS fc_methodology,
+    f.data_sources AS fc_data_sources,
+    f.diagnostics AS fc_diagnostics
 FROM contracts c
 LEFT JOIN (
     SELECT ticker, MAX(ts) AS max_ts FROM market_snapshots GROUP BY ticker
@@ -90,6 +101,7 @@ def _load_rows(db: Database) -> list[_Row]:
             series_ticker=r["series_ticker"] or "",
             category=r["category"] or "other",
             title=r["title"] or "",
+            subtitle=r["subtitle"] or None,
             close_time=_parse_iso(r["close_time"]),
             yes_bid=r["yes_bid"],
             yes_ask=r["yes_ask"],
@@ -102,9 +114,23 @@ def _load_rows(db: Database) -> list[_Row]:
             fc_model_confidence=r["fc_model_confidence"],
             fc_null_reason=r["fc_null_reason"],
             fc_forecaster=r["fc_forecaster"],
+            fc_version=r["fc_version"],
             fc_ts=_parse_iso(r["fc_ts"]),
+            fc_methodology=_parse_json(r["fc_methodology"]),
+            fc_data_sources=_parse_json(r["fc_data_sources"]),
+            fc_diagnostics=_parse_json(r["fc_diagnostics"]),
         ))
     return out
+
+
+def _parse_json(s: str | None) -> dict[str, Any]:
+    if not s:
+        return {}
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else {}
+    except (ValueError, TypeError):
+        return {}
 
 
 def _dte_days(close: datetime | None, now: datetime) -> float | None:
@@ -237,9 +263,53 @@ td.num, th.num { text-align: right; }
 tr:nth-child(even) td { background: var(--row-alt); }
 .ticker { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--accent); }
 .title { max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.yes-side { color: var(--muted); font-size: 11px; }
 .edge.pos { color: #4ade80; font-weight: 600; }
 .edge.neg { color: #f87171; font-weight: 600; }
 .edge.neu { color: var(--muted); }
+.edge-click { cursor: pointer; user-select: none; }
+.edge-click:hover { background: #1a1f26; }
+.edge-caret { color: var(--muted); font-size: 10px; margin-left: 2px; transition: transform 0.15s; display: inline-block; }
+.edge-click.open .edge-caret { transform: rotate(90deg); }
+.detail-row td {
+    background: #0a0c0f !important;
+    padding: 0 !important;
+    border-bottom: 1px solid var(--border);
+}
+.detail-card {
+    padding: 16px 20px 20px;
+    border-left: 3px solid var(--accent);
+    font-size: 12.5px;
+    line-height: 1.55;
+}
+.detail-meta {
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 12px;
+}
+.detail-meta b { color: var(--fg); font-weight: 600; text-transform: none; letter-spacing: 0; }
+.detail-section { margin-top: 12px; }
+.detail-h {
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 6px;
+    font-weight: 600;
+}
+.detail-empty { color: var(--muted); font-style: italic; font-size: 12px; }
+.kv {
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    gap: 8px 16px;
+    padding: 2px 0;
+    border-bottom: 1px dashed #171b22;
+}
+.kv:last-child { border-bottom: none; }
+.kv .k { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
+.kv .v { color: var(--fg); word-break: break-word; }
 .bet { text-align: center; font-weight: 700; letter-spacing: 0.04em; font-size: 12px; }
 .bet.pos { color: #0b0d10; background: #4ade80; }
 .bet.neg { color: #fff; background: #dc2626; }
@@ -276,10 +346,18 @@ _INLINE_JS = """
 (function(){
   var pills = document.querySelectorAll('.pill');
   var rows = document.querySelectorAll('tbody tr[data-cat]');
+  var activeCat = 'all';
   function apply(cat){
+    activeCat = cat;
     for (var i=0;i<rows.length;i++){
       var r = rows[i];
-      r.style.display = (cat === 'all' || r.getAttribute('data-cat') === cat) ? '' : 'none';
+      var catMatch = (cat === 'all' || r.getAttribute('data-cat') === cat);
+      // Detail rows inherit visibility from category and from their expanded state.
+      if (r.classList.contains('detail-row')) {
+        r.style.display = (catMatch && !r.hasAttribute('hidden')) ? '' : 'none';
+      } else {
+        r.style.display = catMatch ? '' : 'none';
+      }
     }
     for (var j=0;j<pills.length;j++){
       pills[j].classList.toggle('active', pills[j].getAttribute('data-cat') === cat);
@@ -287,6 +365,26 @@ _INLINE_JS = """
   }
   for (var k=0;k<pills.length;k++){
     pills[k].addEventListener('click', function(e){ apply(e.currentTarget.getAttribute('data-cat')); });
+  }
+  // Toggle edge-detail rows on click.
+  var edges = document.querySelectorAll('.edge-click');
+  for (var n=0;n<edges.length;n++){
+    edges[n].addEventListener('click', function(e){
+      var id = e.currentTarget.getAttribute('data-detail');
+      var d = document.getElementById(id);
+      if (!d) return;
+      var wasHidden = d.hasAttribute('hidden');
+      if (wasHidden) {
+        d.removeAttribute('hidden');
+        e.currentTarget.classList.add('open');
+      } else {
+        d.setAttribute('hidden', '');
+        e.currentTarget.classList.remove('open');
+      }
+      // Reapply the category filter so the toggle respects it.
+      var catMatch = (activeCat === 'all' || d.getAttribute('data-cat') === activeCat);
+      d.style.display = (catMatch && !d.hasAttribute('hidden')) ? '' : 'none';
+    });
   }
 })();
 """
@@ -311,6 +409,109 @@ def _edge_points(r: _Row) -> float | None:
     if r.fc_p_yes is None or mid is None:
         return None
     return r.fc_p_yes * 100.0 - mid
+
+
+def _fmt_diag_value(v: Any) -> str:
+    if isinstance(v, float):
+        if abs(v) >= 1000 or (v != 0 and abs(v) < 1e-3):
+            return f"{v:.4g}"
+        return f"{v:.4f}".rstrip("0").rstrip(".")
+    if isinstance(v, (list, tuple)):
+        return ", ".join(_fmt_diag_value(x) for x in v)
+    if isinstance(v, dict):
+        return json.dumps(v, default=str)
+    return str(v)
+
+
+def _kv_block(d: dict[str, Any]) -> str:
+    if not d:
+        return "<div class=detail-empty>(none)</div>"
+    rows: list[str] = []
+    for k, v in d.items():
+        rows.append(
+            f"<div class=kv>"
+            f"<span class=k>{html.escape(str(k))}</span>"
+            f"<span class=v>{html.escape(_fmt_diag_value(v))}</span>"
+            f"</div>"
+        )
+    return "".join(rows)
+
+
+def _build_detail_html(r: _Row, mid: float | None) -> str:
+    """Render the audit panel that explains how this row's edge was produced."""
+    fair_pts = r.fc_p_yes * 100.0 if r.fc_p_yes is not None else None
+    edge_pts = _edge_points(r)
+    bet_label, _, bet_reason = _bet_recommendation(r)
+
+    spread = None
+    if r.yes_bid is not None and r.yes_ask is not None:
+        spread = r.yes_ask - r.yes_bid
+    ci = ""
+    if r.fc_p05 is not None and r.fc_p95 is not None:
+        ci = f"  [CI: {r.fc_p05 * 100:.1f}¢ – {r.fc_p95 * 100:.1f}¢]"
+
+    pricing_lines: list[str] = []
+    pricing_lines.append(
+        f"<div class=kv><span class=k>market mid</span>"
+        f"<span class=v>{_fmt_cents(mid)}"
+        f" (bid {_fmt_cents(r.yes_bid)} / ask {_fmt_cents(r.yes_ask)}, "
+        f"spread {_fmt_cents(spread)})</span></div>"
+    )
+    if fair_pts is not None:
+        pricing_lines.append(
+            f"<div class=kv><span class=k>model fair</span>"
+            f"<span class=v>{fair_pts:.2f}¢{html.escape(ci)}</span></div>"
+        )
+    if edge_pts is not None:
+        sign = "+" if edge_pts > 0 else ""
+        pricing_lines.append(
+            f"<div class=kv><span class=k>edge</span>"
+            f"<span class=v>{sign}{edge_pts:.2f}¢ "
+            f"(= model fair − market mid)</span></div>"
+        )
+    conf = r.fc_model_confidence
+    conf_txt = f"{conf * 100:.1f}%" if conf is not None else "—"
+    rec_txt = f"{bet_label}"
+    if bet_label == "—" and bet_reason:
+        rec_txt += f" — {bet_reason}"
+    pricing_lines.append(
+        f"<div class=kv><span class=k>recommendation</span>"
+        f"<span class=v>{html.escape(rec_txt)} (confidence {conf_txt})</span></div>"
+    )
+    if r.subtitle:
+        pricing_lines.append(
+            f"<div class=kv><span class=k>YES resolves on</span>"
+            f"<span class=v>{html.escape(r.subtitle)}</span></div>"
+        )
+
+    fc_ts_txt = (
+        r.fc_ts.strftime("%Y-%m-%d %H:%M UTC") if r.fc_ts else "—"
+    )
+    meta = (
+        f"<div class=detail-meta>"
+        f"forecaster <b>{html.escape(r.fc_forecaster or '—')}</b>"
+        f" (v{html.escape(r.fc_version or '—')}) · "
+        f"ran {html.escape(fc_ts_txt)}"
+        f"</div>"
+    )
+
+    return (
+        "<div class=detail-card>"
+        + meta
+        + "<div class=detail-section><div class=detail-h>Pricing breakdown</div>"
+        + "".join(pricing_lines)
+        + "</div>"
+        + "<div class=detail-section><div class=detail-h>How this edge was computed</div>"
+        + _kv_block(r.fc_methodology)
+        + "</div>"
+        + "<div class=detail-section><div class=detail-h>Data inputs (with fetch timestamps)</div>"
+        + _kv_block(r.fc_data_sources)
+        + "</div>"
+        + "<div class=detail-section><div class=detail-h>Diagnostics</div>"
+        + _kv_block(r.fc_diagnostics)
+        + "</div>"
+        + "</div>"
+    )
 
 
 def build_report_html(db: Database, *, now: datetime | None = None) -> str:
@@ -358,6 +559,7 @@ def build_report_html(db: Database, *, now: datetime | None = None) -> str:
     parts.append(f"and whether the market is liquid enough to trade (we suppress recommendations when |edge| &lt; {_BET_MIN_EDGE_PTS:.0f}¢, ")
     parts.append(f"confidence &lt; {_BET_MIN_CONF*100:.0f}%, spread &gt; {_BET_MAX_SPREAD_CENTS:.0f}¢, ")
     parts.append(f"vol &lt; {_BET_MIN_VOL_24H:.0f}, or either side is pinned to 0¢/100¢). ")
+    parts.append("Click any <b>Edge</b> value to audit how that edge was derived — model, data inputs, and raw diagnostics. ")
     parts.append("Rows the forecaster couldn't run on sink to the bottom.")
     parts.append("</div>")
 
@@ -392,21 +594,31 @@ def build_report_html(db: Database, *, now: datetime | None = None) -> str:
     parts.append("<th class=num>Vol 24h</th>")
     parts.append("</tr></thead><tbody>")
 
-    for r in sorted_rows:
+    for idx, r in enumerate(sorted_rows):
         dte = _dte_days(r.close_time, now)
         mid = _mid_cents(r)
         spread = None
         if r.yes_bid is not None and r.yes_ask is not None:
             spread = r.yes_ask - r.yes_bid
         cat_attr = html.escape(r.category)
-        parts.append(f"<tr data-cat='{cat_attr}'>")
+        row_id = f"row-{idx}"
+        parts.append(f"<tr data-cat='{cat_attr}' id='{row_id}'>")
         parts.append(
             f"<td class=ticker>"
             f"<a href='{html.escape(_kalshi_url(r))}' target=_blank rel=noopener>"
             f"{html.escape(r.ticker)}</a>"
             f"<span class=cat-tag>{cat_attr}</span></td>"
         )
-        parts.append(f"<td class=title title='{html.escape(r.title)}'>{html.escape(r.title)}</td>")
+        title_html = html.escape(r.title)
+        tooltip = r.title
+        if r.subtitle:
+            title_html += (
+                f" <span class=yes-side>· YES = {html.escape(r.subtitle)}</span>"
+            )
+            tooltip = f"{r.title} (YES resolves on: {r.subtitle})"
+        parts.append(
+            f"<td class=title title='{html.escape(tooltip)}'>{title_html}</td>"
+        )
         parts.append(f"<td class=num>{_fmt_dte(dte)}</td>")
         parts.append(f"<td class=num>{_fmt_cents(mid)}</td>")
         if r.fc_p_yes is not None:
@@ -420,7 +632,12 @@ def build_report_html(db: Database, *, now: datetime | None = None) -> str:
                 )
             parts.append(f"<td class=num>{fair_cents:.1f}¢{ci}</td>")
             edge_txt, edge_cls = _fmt_edge_points(r.fc_p_yes, mid)
-            parts.append(f"<td class='num edge {edge_cls}'>{edge_txt}</td>")
+            parts.append(
+                f"<td class='num edge {edge_cls} edge-click' "
+                f"data-detail='detail-{idx}' "
+                f"title='Click to see how this edge was derived'>"
+                f"{edge_txt} <span class=edge-caret>▸</span></td>"
+            )
             bet_label, bet_cls, bet_reason = _bet_recommendation(r)
             bet_attr = f" title='{html.escape(bet_reason)}'" if bet_reason else ""
             parts.append(
@@ -439,6 +656,13 @@ def build_report_html(db: Database, *, now: datetime | None = None) -> str:
         parts.append(f"<td class=num>{_fmt_cents(spread)}</td>")
         parts.append(f"<td class=num>{_fmt_int(r.volume_24h)}</td>")
         parts.append("</tr>")
+        if r.fc_p_yes is not None:
+            detail_inner = _build_detail_html(r, mid)
+            parts.append(
+                f"<tr class='detail-row' id='detail-{idx}' data-cat='{cat_attr}' hidden>"
+                f"<td colspan=10>{detail_inner}</td>"
+                f"</tr>"
+            )
     parts.append("</tbody></table>")
 
     parts.append(f"<script>{_INLINE_JS}</script>")
