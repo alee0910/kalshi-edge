@@ -122,6 +122,36 @@ def test_match_game_date_mismatch_returns_none() -> None:
     assert match_game(sc, "Will the White Sox win?", games) is None
 
 
+def test_match_game_subtitle_agrees_accepts() -> None:
+    """When Kalshi's yes_sub_title names the YES team, match_game requires
+    the chosen team to overlap with it. Happy path: they agree."""
+    sc = parse_sports_contract("KXMLBGAME", "KXMLBGAME-26APR181605CWSATH")
+    assert sc is not None
+    games = [_game("Chicago White Sox", "Oakland Athletics", date(2026, 4, 18))]
+    res = match_game(
+        sc, "Will the White Sox beat the Athletics?", games,
+        yes_subtitle="White Sox",
+    )
+    assert res is not None
+    _, team = res
+    assert team == "Chicago White Sox"
+
+
+def test_match_game_subtitle_disagrees_abstains() -> None:
+    """Regression: if title-position says YES = A but Kalshi subtitle says
+    YES = B, we abstain rather than ship a sign-flipped forecast.
+    This is the sports analog of the weather T61-less-than bug."""
+    sc = parse_sports_contract("KXMLBGAME", "KXMLBGAME-26APR181605CWSATH")
+    assert sc is not None
+    games = [_game("Chicago White Sox", "Oakland Athletics", date(2026, 4, 18))]
+    # Title-position would pick White Sox, but subtitle says YES = Athletics.
+    res = match_game(
+        sc, "Will the White Sox beat the Athletics?", games,
+        yes_subtitle="Oakland Athletics",
+    )
+    assert res is None
+
+
 def test_match_game_ambiguous_same_city() -> None:
     sc = parse_sports_contract("KXMLBGAME", "KXMLBGAME-26APR181605CWSATH")
     assert sc is not None

@@ -79,6 +79,7 @@ def find_best_match(
     client: PolymarketClient,
     search_keywords: list[str],
     title: str,
+    subtitle: str | None = None,
     target_window: tuple[datetime, datetime] | None = None,
     extra_required_tokens: set[str] | None = None,
     limit: int = 500,
@@ -87,6 +88,12 @@ def find_best_match(
 
     ``search_keywords`` — any-match filter used on Polymarket's side.
     ``title``           — the Kalshi contract title we're matching against.
+    ``subtitle``        — Kalshi's ``yes_sub_title`` field. When present,
+        its discriminating tokens (outcome label, candidate name, bp
+        amount, …) are **required** in the Polymarket question. This
+        prevents e.g. a Kalshi "25bp cut" contract from being priced off
+        a Polymarket "50bp cut" market just because the remaining
+        title-tokens (fomc / may / 2026) overlap enough to clear Jaccard.
     ``target_window``   — if given, Polymarket endDate must fall inside.
     ``extra_required_tokens`` — tokens that must all appear in the
         Polymarket question (AND). Use this to enforce e.g. the target
@@ -101,8 +108,17 @@ def find_best_match(
         return None
 
     kalshi_tokens = _tokens(title)
+    subtitle_tokens = _tokens(subtitle or "")
+    # Fold subtitle into the scoring pool so shared outcome tokens boost
+    # the right market (not penalize it).
+    kalshi_tokens = kalshi_tokens | subtitle_tokens
     if not kalshi_tokens:
         return None
+
+    required: set[str] = set(extra_required_tokens or ())
+    # Require every subtitle token to appear in the Polymarket question
+    # — this is the YES-side discriminator.
+    required |= subtitle_tokens
 
     scored: list[tuple[float, PolymarketMarket]] = []
     for m in pool:
@@ -114,7 +130,7 @@ def find_best_match(
             if ed < lo or ed > hi:
                 continue
         q_tokens = _tokens(m.question)
-        if extra_required_tokens and not extra_required_tokens.issubset(q_tokens):
+        if required and not required.issubset(q_tokens):
             continue
         score = jaccard(kalshi_tokens, q_tokens)
         if score > 0.0:

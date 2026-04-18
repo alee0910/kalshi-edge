@@ -165,6 +165,44 @@ def test_find_best_match_respects_date_window() -> None:
     assert m is None
 
 
+def test_find_best_match_subtitle_disambiguates_opposite_outcome() -> None:
+    """Regression: Kalshi KXFEDDECISION-26MAY-T25 (subtitle "25 basis points")
+    must not match a Polymarket market about the 50bp outcome, even
+    though most of the rest of the title overlaps.
+
+    This is the rates/politics analog of the weather strike_type sign
+    flip: we had enough Jaccard overlap on "fed / may / 2026 / basis /
+    points" to clear _MIN_SCORE against a 50bp Polymarket market, but
+    the two resolve on different binary events.
+    """
+    client = MagicMock()
+    client.search_active.return_value = [
+        _pm("t50", "Will the Fed cut 50 basis points at May 2026 meeting", None),
+        _pm("t25", "Will the Fed cut 25 basis points at May 2026 meeting", None),
+    ]
+    m = find_best_match(
+        client=client, search_keywords=["fed"],
+        title="Fed rate decision May 2026 meeting",
+        subtitle="25 basis points",
+    )
+    assert m is not None
+    assert m.market.slug == "t25"
+
+
+def test_find_best_match_subtitle_filters_all_yields_none() -> None:
+    """If no candidate contains the subtitle tokens, abstain."""
+    client = MagicMock()
+    client.search_active.return_value = [
+        _pm("t50", "Will the Fed cut 50 basis points at May 2026 meeting", None),
+    ]
+    m = find_best_match(
+        client=client, search_keywords=["fed"],
+        title="Fed rate decision May 2026 meeting",
+        subtitle="25 basis points",
+    )
+    assert m is None
+
+
 def test_find_best_match_below_min_score_returns_none() -> None:
     client = MagicMock()
     client.search_active.return_value = [

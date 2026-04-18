@@ -101,7 +101,9 @@ class SportsOddsForecaster(Forecaster):
         if not games:
             return self._null(contract, f"no odds-api games for {sc.sport_key}")
 
-        hit = match_game(sc, contract.title, games)
+        hit = match_game(
+            sc, contract.title, games, yes_subtitle=contract.subtitle,
+        )
         if hit is None:
             return self._null(
                 contract,

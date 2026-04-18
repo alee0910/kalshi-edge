@@ -126,6 +126,7 @@ class RatesFOMCForecaster(Forecaster):
             client=client,
             search_keywords=self._SEARCH_KEYWORDS,
             title=contract.title,
+            subtitle=contract.subtitle,
             target_window=window,
             extra_required_tokens=required,
         )

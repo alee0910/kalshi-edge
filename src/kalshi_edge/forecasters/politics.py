@@ -90,6 +90,7 @@ class PoliticsCrossMarketForecaster(Forecaster):
             client=client,
             search_keywords=_SEARCH_KEYWORDS,
             title=contract.title,
+            subtitle=contract.subtitle,
             target_window=window,
         )
         if match is None:

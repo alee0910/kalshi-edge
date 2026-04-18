@@ -99,12 +99,21 @@ def _team_tokens(team: str) -> list[str]:
 
 def match_game(
     sc: SportsContract, title: str, games: list[Game],
+    *, yes_subtitle: str | None = None,
 ) -> tuple[Game, str] | None:
     """Pick the odds-api game + YES-team corresponding to a Kalshi contract.
 
     Returns (game, target_team) or None if no unambiguous match.
     Title-position disambiguates when both teams appear: Kalshi phrasing
     "Will <X> beat <Y>?" puts the YES team first.
+
+    ``yes_subtitle`` — Kalshi's ``yes_sub_title`` field, which for h2h
+    markets explicitly names the YES team ("Lakers", "Toronto Raptors",
+    …). When present we *require* the chosen team's tokens to overlap
+    with it; a mismatch means either our title-position heuristic picked
+    the wrong side or the game-to-ticker binding is off. Either way we'd
+    rather abstain than ship a sign-flipped forecast — exactly the class
+    of bug that produced our 0¢/99% weather blowup.
     """
     title_l = (title or "").lower()
     candidates: list[tuple[Game, str, int]] = []  # game, team, earliest-hit position
@@ -136,6 +145,14 @@ def match_game(
     if len(candidates) > 1:
         return None
     g, team, _ = candidates[0]
+    if yes_subtitle:
+        sub_l = yes_subtitle.lower()
+        team_toks = [t for t in _team_tokens(team) if len(t) >= 3]
+        if team_toks and not any(t in sub_l for t in team_toks):
+            # Chosen team doesn't appear in Kalshi's own YES-label.
+            # Either our title-parse picked the wrong side or the game
+            # binding is wrong. Abstain.
+            return None
     return (g, team)
 
 
